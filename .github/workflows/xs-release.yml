@@ -1,0 +1,524 @@
+# xScaler fork: build, scan, publish, sign and verify the loki image.
+#
+# Release mode (push of a v*-xs.* tag, or workflow_dispatch with a tag input):
+#   build both arches -> Trivy gate -> push by digest to GHCR -> index ->
+#   SBOM + provenance + cosign -> copy the same digest to ECR -> cosign ->
+#   verify both registries.
+# Verify mode (pull requests and pushes to main or ci/** without a tag): build both arches and scan, nothing is pushed.
+name: xs-release
+
+on:
+  push:
+    branches:
+      - main
+      - "ci/**"
+    tags:
+      - "v*-xs.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, for example v3.7.9-xs.0"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: xs-release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  GHCR_IMAGE: ghcr.io/xscaler/loki
+  ECR_IMAGE: 483075907540.dkr.ecr.eu-west-1.amazonaws.com/xscaler/loki
+  AWS_REGION: eu-west-1
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      mode: ${{ steps.meta.outputs.mode }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      checkout_ref: ${{ steps.meta.outputs.checkout_ref }}
+      published: ${{ steps.published.outputs.published }}
+      digest: ${{ steps.published.outputs.digest }}
+    steps:
+      - name: Resolve mode and version
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG}"
+            if [ "${REF}" != "refs/heads/main" ] && [ "${REF_TYPE}" != "tag" ]; then
+              echo "::error::releases can only be dispatched from main or a release tag (ref is ${REF})"
+              exit 1
+            fi
+          elif [ "${REF_TYPE}" = "tag" ]; then
+            tag="${REF_NAME}"
+          fi
+
+          if [ -n "${tag}" ]; then
+            if ! printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?-xs\.[0-9]+$'; then
+              echo "::error::tag '${tag}' does not match v<upstream-version>-xs.<n>"
+              exit 1
+            fi
+            {
+              echo "mode=release"
+              echo "tag=${tag}"
+              echo "version=${tag#v}"
+              echo "checkout_ref=refs/tags/${tag}"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            {
+              echo "mode=verify"
+              echo "tag="
+              echo "version=verify-${SHA:0:7}"
+              echo "checkout_ref=${SHA}"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up crane
+        if: steps.meta.outputs.mode == 'release'
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to GHCR
+        if: steps.meta.outputs.mode == 'release'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this version is already published
+        id: published
+        env:
+          MODE: ${{ steps.meta.outputs.mode }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${MODE}" != "release" ]; then
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            echo "digest=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          err="$(mktemp)"
+          if crane manifest "${GHCR_IMAGE}:${VERSION}" >/dev/null 2>"${err}"; then
+            d="$(crane digest "${GHCR_IMAGE}:${VERSION}")"
+            echo "${GHCR_IMAGE}:${VERSION} already exists (${d}); reusing it, no rebuild"
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+            echo "digest=${d}" >> "${GITHUB_OUTPUT}"
+          elif grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|NOT_FOUND|404|denied' "${err}"; then
+            # Login succeeded above, so a 404 or denied here means the package does not exist yet.
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            echo "digest=" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::error::could not determine whether ${GHCR_IMAGE}:${VERSION} exists:"
+            cat "${err}"
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.published != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      MODE: ${{ needs.prepare.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Read build parameters
+        id: params
+        run: |
+          set -euo pipefail
+          go_version="$(sed -n 's/^GO_VERSION *:= *//p' Makefile)"
+          if [ -z "${go_version}" ]; then
+            echo "::error::GO_VERSION not found in Makefile"
+            exit 1
+          fi
+          {
+            echo "go_version=${go_version}"
+            echo "revision=$(git rev-parse HEAD)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: cmd/loki/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            IMAGE_TAG=${{ needs.prepare.outputs.version }}
+            GO_VERSION=${{ steps.params.outputs.go_version }}
+          labels: |
+            org.opencontainers.image.title=loki
+            org.opencontainers.image.source=https://github.com/xscaler/loki
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.params.outputs.revision }}
+          tags: loki:${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          outputs: type=docker,dest=${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+
+      - name: Load image and check the reported version
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+        run: |
+          set -euo pipefail
+          docker load -i "${IMAGE_TAR}"
+          out="$(docker run --rm "loki:${ARCH}" -version 2>&1)"
+          echo "${out}"
+          if ! printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} "; then
+            echo "::error::binary does not report version ${VERSION}"
+            exit 1
+          fi
+
+      - name: Set up Trivy
+        uses: ./.github/actions/xs-setup-trivy
+
+      - name: Trivy report (HIGH and CRITICAL)
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+          SARIF: ${{ runner.temp }}/trivy-${{ matrix.arch }}.sarif
+        run: |
+          set -euo pipefail
+          trivy image --input "${IMAGE_TAR}" --severity HIGH,CRITICAL \
+            --format table --exit-code 0 --no-progress
+          trivy image --input "${IMAGE_TAR}" --severity HIGH,CRITICAL \
+            --format sarif --output "${SARIF}" --exit-code 0 --no-progress
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-${{ matrix.arch }}.sarif
+          category: trivy-loki-${{ matrix.arch }}
+
+      - name: Trivy gate (fixable CRITICAL fails the build)
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+        run: |
+          trivy image --input "${IMAGE_TAR}" --severity CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress
+
+      - name: Upload image tarball
+        if: env.MODE == 'release'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loki-${{ matrix.arch }}
+          path: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: publish to GHCR
+    needs: [prepare, build]
+    if: >-
+      !cancelled() && needs.prepare.outputs.mode == 'release' &&
+      (needs.build.result == 'success' || needs.prepare.outputs.published == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ALREADY_PUBLISHED: ${{ needs.prepare.outputs.published }}
+    steps:
+      - name: Checkout helper scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Set up crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download image tarballs
+        if: env.ALREADY_PUBLISHED != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: loki-*
+          path: ${{ runner.temp }}/images
+
+      - name: Push per-arch images by digest and create the index
+        if: env.ALREADY_PUBLISHED != 'true'
+        env:
+          IMAGES_DIR: ${{ runner.temp }}/images
+        run: |
+          set -euo pipefail
+          refs=()
+          for arch in amd64 arm64; do
+            tar="${IMAGES_DIR}/loki-${arch}/loki-${arch}.tar"
+            d="$(crane digest --tarball "${tar}")"
+            crane push "${tar}" "${GHCR_IMAGE}@${d}"
+            echo "${arch}: ${d}"
+            refs+=("${GHCR_IMAGE}@${d}")
+          done
+          docker buildx imagetools create --tag "${GHCR_IMAGE}:${VERSION}" "${refs[@]}"
+
+      - name: Resolve index digest
+        id: digest
+        run: |
+          set -euo pipefail
+          d="$(crane digest "${GHCR_IMAGE}:${VERSION}")"
+          echo "digest=${d}" >> "${GITHUB_OUTPUT}"
+          echo "${GHCR_IMAGE}:${VERSION} -> ${d}"
+          docker buildx imagetools inspect "${GHCR_IMAGE}@${d}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.GHCR_IMAGE }}@${{ steps.digest.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/sbom.spdx.json
+          push-to-registry: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image with cosign (keyless, idempotent)
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          export CERT_IDENTITY_REGEXP="^https://github\.com/${REPOSITORY}/\.github/workflows/xs-release\.yml@refs/(heads/main|tags/v.+-xs\.[0-9]+)$"
+          .github/scripts/xs-ensure-signed.sh "${GHCR_IMAGE}@${DIGEST}"
+
+      - name: Keep the SBOM for the ECR job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/sbom.spdx.json
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-ecr:
+    name: copy to ECR
+    needs: [prepare, publish]
+    if: "!cancelled() && needs.publish.result == 'success'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Checkout helper scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - name: Explain AWS authentication failure
+        if: failure() && steps.aws.outcome == 'failure'
+        run: |
+          echo "::error title=ECR publish blocked::AWS role assumption failed. The ECR repositories and the GitHub OIDC trust for xscaler/loki come from a terraform change that may not be applied yet. The role trusts only repo:xscaler/loki:ref:refs/heads/main and ref:refs/tags/v*. The image is already in GHCR; re-run this workflow once the change is applied (it resumes without rebuilding)."
+          exit 1
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Set up crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Copy the digest to ECR
+        id: copy
+        run: |
+          set -euo pipefail
+          err="$(mktemp)"
+          if crane manifest "${ECR_IMAGE}:${VERSION}" >/dev/null 2>"${err}"; then
+            existing="$(crane digest "${ECR_IMAGE}:${VERSION}")"
+            if [ "${existing}" != "${DIGEST}" ]; then
+              echo "::error::${ECR_IMAGE}:${VERSION} already exists with digest ${existing}, expected ${DIGEST}. ECR tags are immutable; bump the -xs.<n> suffix."
+              exit 1
+            fi
+            echo "already copied"
+          elif grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|NOT_FOUND|404|RepositoryNotFound' "${err}"; then
+            crane copy "${GHCR_IMAGE}@${DIGEST}" "${ECR_IMAGE}:${VERSION}"
+          else
+            echo "::error::could not check ${ECR_IMAGE}:${VERSION}:"
+            cat "${err}"
+            exit 1
+          fi
+          got="$(crane digest "${ECR_IMAGE}:${VERSION}")"
+          if [ "${got}" != "${DIGEST}" ]; then
+            echo "::error::ECR digest ${got} differs from GHCR digest ${DIGEST}"
+            exit 1
+          fi
+
+      - name: Explain ECR copy failure
+        if: failure() && steps.copy.outcome == 'failure'
+        run: |
+          echo "::error title=ECR copy failed::Pushing to ${ECR_IMAGE} failed. Check that the ECR repository xscaler/loki exists and that the push role has access to it (terraform change pending?). The image is already in GHCR; re-run this workflow to resume."
+          exit 1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/sbom
+
+      - name: Sign and attach SBOM in ECR (idempotent)
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SBOM: ${{ runner.temp }}/sbom/sbom.spdx.json
+        run: |
+          set -euo pipefail
+          export CERT_IDENTITY_REGEXP="^https://github\.com/${REPOSITORY}/\.github/workflows/xs-release\.yml@refs/(heads/main|tags/v.+-xs\.[0-9]+)$"
+          .github/scripts/xs-ensure-signed.sh "${ECR_IMAGE}@${DIGEST}" "${SBOM}"
+
+  verify:
+    name: verify signatures and version
+    needs: [prepare, publish, publish-ecr]
+    if: "!cancelled() && needs.publish-ecr.result == 'success'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify signatures in both registries
+        run: |
+          set -euo pipefail
+          identity="^https://github\.com/${REPOSITORY}/\.github/workflows/xs-release\.yml@refs/(heads/main|tags/v.+-xs\.[0-9]+)$"
+          for image in "${GHCR_IMAGE}" "${ECR_IMAGE}"; do
+            echo "== cosign verify ${image}@${DIGEST}"
+            cosign verify "${image}@${DIGEST}" \
+              --certificate-oidc-issuer "${OIDC_ISSUER}" \
+              --certificate-identity-regexp "${identity}" >/dev/null
+            echo "== cosign verify-attestation (spdxjson) ${image}@${DIGEST}"
+            cosign verify-attestation "${image}@${DIGEST}" --type spdxjson \
+              --certificate-oidc-issuer "${OIDC_ISSUER}" \
+              --certificate-identity-regexp "${identity}" >/dev/null
+          done
+
+      - name: Verify build provenance
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${GHCR_IMAGE}@${DIGEST}" --repo "${REPOSITORY}"
+
+      - name: Verify digests match and the binary reports the release version
+        run: |
+          set -euo pipefail
+          for image in "${GHCR_IMAGE}" "${ECR_IMAGE}"; do
+            got="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+            if [ "${got}" != "${DIGEST}" ]; then
+              echo "::error::${image}:${VERSION} resolves to ${got}, expected ${DIGEST}"
+              exit 1
+            fi
+            platforms="$(docker buildx imagetools inspect "${image}@${DIGEST}" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')"
+            echo "${image} platforms: ${platforms}"
+            case "${platforms}" in *linux/amd64*linux/arm64*|*linux/arm64*linux/amd64*) ;; *) echo "::error::missing platform in ${image}"; exit 1 ;; esac
+            out="$(docker run --rm "${image}@${DIGEST}" -version 2>&1)"
+            echo "${out}"
+            printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
+              echo "::error::${image} reports a different version than ${VERSION}"
+              exit 1
+            }
+          done

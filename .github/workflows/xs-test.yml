@@ -1,0 +1,247 @@
+# xScaler fork: unit tests and lint, mirroring upstream's reusable
+# grafana/loki-release check workflow (pinned below) on GitHub-hosted runners.
+#
+# Upstream jobs not reproduced here:
+#   - "build docs website": needs the grafana/docs-base image and Grafana
+#     docs infra; the fork ships no docs site.
+#   - GitHub App token / Grafana self-hosted runner labels (ubuntu-x64): not
+#     available; the jobs run on ubuntu-latest in the same golang image.
+name: xs-test
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - "ci/**"
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions: {}
+
+concurrency:
+  group: xs-test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # grafana/loki-release commit upstream's check workflow is pinned to.
+  RELEASE_LIB_REF: 6cba58c3b7083631092af8e8fbaeb71a647fab93
+  BUILD_IN_CONTAINER: "false"
+
+jobs:
+  check-files:
+    name: check files
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install build tools
+        run: |
+          curl -fsSL -o /tmp/install_workflow_dependencies.sh \
+            "https://raw.githubusercontent.com/grafana/loki-release/${RELEASE_LIB_REF}/workflows/install_workflow_dependencies.sh"
+          # SRC_DIR points nowhere so the script skips the jsonnet bundle update,
+          # as it does in upstream's check workflow.
+          SRC_DIR=/nonexistent sh /tmp/install_workflow_dependencies.sh loki-release loki-build-tools
+      - name: Install shellcheck
+        run: |
+          apt-get install -qy tar xz-utils
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/v0.9.0/shellcheck-v0.9.0.linux.x86_64.tar.xz
+          echo "700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          install -m 0755 /tmp/shellcheck-v0.9.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version
+      - name: Check generated files
+        run: make check-generated-files
+      - name: Check go.mod
+        run: make check-mod
+      - name: Check docs
+        run: make check-doc
+      - name: Validate example configs
+        run: make validate-example-configs
+      - name: Validate dev cluster config
+        run: make validate-dev-cluster-config
+      - name: Check example config docs
+        run: make check-example-config-doc
+      - name: Lint scripts
+        run: make lint-scripts
+      - name: Check format
+        env:
+          GIT_TARGET_BRANCH: main
+        run: |
+          git fetch --no-tags origin "main:refs/remotes/origin/${GIT_TARGET_BRANCH}"
+          make check-format
+
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.10.1
+          args: -v --timeout 15m --build-tags linux
+          only-new-issues: false
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Integration tests
+        run: make test-integration
+
+  collect-packages:
+    name: collect test packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      packages: ${{ steps.gather.outputs.packages }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Gather packages
+        id: gather
+        run: |
+          packages="$(find . -path '*_test.go' -printf '%h\n' \
+            | grep -e "pkg/push" -e "integration" -e "operator" -e "helm" -v \
+            | cut -d / -f 2,3 \
+            | uniq \
+            | sort \
+            | jq --raw-input --slurp --compact-output 'split("\n")[:-1]')"
+          echo "packages=${packages}" >> "${GITHUB_OUTPUT}"
+
+  test-packages:
+    name: test ${{ matrix.package }}
+    needs: collect-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.collect-packages.outputs.packages) }}
+    env:
+      MATRIX_PACKAGE: ${{ matrix.package }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@v1.9.0
+      - name: Test package
+        run: gotestsum -- -tags=assert -covermode=atomic -coverprofile=coverage.txt -p=4 "./${MATRIX_PACKAGE}/..."
+
+  faillint:
+    name: faillint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install faillint
+        run: go install github.com/fatih/faillint@v1.15.0
+      - name: faillint
+        run: faillint -paths "sync/atomic=go.uber.org/atomic" ./...
+
+  test-push-package:
+    name: test pkg/push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container:
+      image: golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@v1.9.0
+      - name: go mod tidy
+        working-directory: pkg/push
+        run: go mod tidy
+      - name: Test pkg/push
+        working-directory: pkg/push
+        run: gotestsum -- -covermode=atomic -coverprofile=coverage.txt -p=4 ./...
+
+  checks-passed:
+    name: checks passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - check-files
+      - faillint
+      - golangci-lint
+      - integration
+      - test-packages
+      - test-push-package
+    permissions: {}
+    steps:
+      - name: Verify all jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in ${RESULTS}; do
+            if [ "${r}" != "success" ]; then
+              echo "::error::one or more checks did not succeed: ${RESULTS}"
+              exit 1
+            fi
+          done
+          echo "All checks passed"

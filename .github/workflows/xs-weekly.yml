@@ -1,0 +1,95 @@
+# xScaler fork: weekly scan of the newest released loki image. When it carries
+# fixable HIGH or CRITICAL findings, cut the next -xs.<n> tag on the same commit
+# and dispatch xs-release so the rebuild picks up patched base images.
+name: xs-weekly
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: xs-weekly
+  cancel-in-progress: false
+
+env:
+  GHCR_IMAGE: ghcr.io/xscaler/loki
+
+jobs:
+  rescan:
+    name: scan latest release and rebuild if needed
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the next release tag
+      actions: write # dispatch xs-release
+      packages: read # pull the released image for scanning
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find the highest release tag
+        id: latest
+        run: |
+          set -euo pipefail
+          tag="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?-xs\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -z "${tag}" ]; then
+            echo "::notice::no v*-xs.* tag exists yet, nothing to scan"
+            echo "tag=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
+          echo "commit=$(git rev-list -n1 "${tag}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        if: steps.latest.outputs.tag != ''
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Trivy
+        if: steps.latest.outputs.tag != ''
+        uses: ./.github/actions/xs-setup-trivy
+
+      - name: Scan the released image
+        id: scan
+        if: steps.latest.outputs.tag != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          REPORT: ${{ runner.temp }}/trivy.json
+        run: |
+          set -euo pipefail
+          trivy image "${GHCR_IMAGE}:${VERSION}" --ignore-unfixed \
+            --severity HIGH,CRITICAL --format json --output "${REPORT}" \
+            --exit-code 0 --no-progress
+          trivy image "${GHCR_IMAGE}:${VERSION}" --ignore-unfixed \
+            --severity HIGH,CRITICAL --format table --exit-code 0 --no-progress
+          count="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "${REPORT}")"
+          echo "fixable HIGH/CRITICAL findings: ${count}"
+          echo "count=${count}" >> "${GITHUB_OUTPUT}"
+
+      - name: Tag and dispatch a rebuild
+        if: steps.latest.outputs.tag != '' && steps.scan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
+          COMMIT: ${{ steps.latest.outputs.commit }}
+        run: |
+          set -euo pipefail
+          base="${LATEST_TAG%-xs.*}"
+          n="${LATEST_TAG##*-xs.}"
+          next="${base}-xs.$((n + 1))"
+          echo "creating ${next} on ${COMMIT}"
+          gh api --method POST "repos/${REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${next}" -f "sha=${COMMIT}"
+          gh workflow run xs-release.yml --repo "${REPOSITORY}" --ref main -f "tag=${next}"
