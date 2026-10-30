@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Decide whether an image that already exists under a release tag can be reused.
 #
-# usage: xs-trust-existing.sh <image> <tag> <commit>
+# usage: xs-trust-existing.sh <image> <tag> <commit> <digest>
 # env:   OIDC_ISSUER, CERT_IDENTITY (exact), REPOSITORY, GH_TOKEN
 # out:   prints the digest on stdout when trusted; exits 1 otherwise.
 #
@@ -18,6 +18,7 @@ set -euo pipefail
 image="${1:?image required}"
 tag="${2:?tag required}"
 commit="${3:?commit required}"
+digest="${4:?digest required}"
 : "${OIDC_ISSUER:?}" "${CERT_IDENTITY:?}" "${REPOSITORY:?}"
 
 fail() {
@@ -25,7 +26,6 @@ fail() {
   exit 1
 }
 
-digest="$(crane digest "${image}:${tag}")"
 ref="${image}@${digest}"
 
 cosign verify "${ref}" --certificate-oidc-issuer "${OIDC_ISSUER}" \

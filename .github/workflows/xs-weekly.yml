@@ -38,6 +38,7 @@ jobs:
       packages: read
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
+      digest: ${{ steps.pick.outputs.digest }}
       version: ${{ steps.pick.outputs.version }}
       commit: ${{ steps.pick.outputs.commit }}
       next_tag: ${{ steps.pick.outputs.next_tag }}
@@ -48,8 +49,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install crane
-        run: .github/scripts/xs-install-tool.sh crane
+      - name: Install crane and cosign
+        run: |
+          set -euo pipefail
+          for t in crane cosign; do .github/scripts/xs-install-tool.sh "${t}"; done
 
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -62,9 +65,12 @@ jobs:
         id: pick
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OIDC_ISSUER: https://token.actions.githubusercontent.com
         run: |
           set -euo pipefail
           export LC_ALL=C
+          identity="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@refs/heads/main"
           re='^v[0-9]+\.[0-9]+\.[0-9]+-xs\.(0|[1-9][0-9]*)$'
           tags=()
           while IFS= read -r t; do
@@ -78,13 +84,23 @@ jobs:
           # Upstream versions, highest first (numeric per component).
           bases="$(printf '%s\n' "${tags[@]}" | sed 's/-xs\..*$//' | sort -u -t. -k1.2,1nr -k2,2nr -k3,3nr)"
           chosen=""
+          digest=""
           while IFS= read -r base; do
             while IFS= read -r n; do
               candidate="${base}-xs.${n}"
               rc=0
-              .github/scripts/xs-manifest-exists.sh "${GHCR_IMAGE}:${candidate#v}" || rc=$?
-              if [[ "${rc}" == "0" ]]; then chosen="${candidate}"; break 2; fi
-              if [[ "${rc}" != "1" ]]; then exit 1; fi
+              d="$(.github/scripts/xs-manifest-exists.sh "${GHCR_IMAGE}:${candidate#v}")" || rc=$?
+              if [[ "${rc}" == "1" ]]; then continue; fi
+              if [[ "${rc}" != "0" ]]; then exit 1; fi
+              # Only a release signed by the exact main identity counts; anything else
+              # may have been pushed by another workflow, so fall back to a lower tag.
+              if cosign verify "${GHCR_IMAGE}@${d}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
+                  --certificate-identity "${identity}" >/dev/null 2>&1; then
+                chosen="${candidate}"
+                digest="${d}"
+                break 2
+              fi
+              echo "::warning::${GHCR_IMAGE}:${candidate#v} has no valid release signature, skipping it"
             done < <(printf '%s\n' "${tags[@]}" | grep -F "${base}-xs." | sed 's/^.*-xs\.//' | sort -rn)
           done <<<"${bases}"
           if [[ -z "${chosen}" ]]; then
@@ -96,6 +112,7 @@ jobs:
           max="$(printf '%s\n' "${tags[@]}" | grep -F "${base}-xs." | sed 's/^.*-xs\.//' | sort -rn | head -n1)"
           {
             echo "tag=${chosen}"
+            echo "digest=${digest}"
             echo "version=${chosen#v}"
             echo "commit=$(git rev-list -n1 "${chosen}")"
             echo "next_tag=${base}-xs.$((max + 1))"
@@ -120,6 +137,7 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       VERSION: ${{ needs.select.outputs.version }}
+      DIGEST: ${{ needs.select.outputs.digest }}
       ARCH: ${{ matrix.arch }}
     steps:
       - name: Checkout workflow files
@@ -141,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           export LC_ALL=C
-          trivy image "${GHCR_IMAGE}:${VERSION}" --platform "linux/${ARCH}" --ignore-unfixed \
+          trivy image "${GHCR_IMAGE}@${DIGEST}" --platform "linux/${ARCH}" --ignore-unfixed \
             --severity HIGH,CRITICAL --format json --output "${RUNNER_TEMP}/published.json" \
             --exit-code 0 --no-progress
           jq -r '[.Results[]?.Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \

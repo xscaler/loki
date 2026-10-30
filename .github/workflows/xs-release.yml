@@ -12,7 +12,7 @@
 #   release    workflow_dispatch on main. The only mode that publishes a release.
 #   rehearsal  push to a ci/** branch. Runs the same publish path against
 #              ghcr.io/xscaler/rehearsal/loki:<shortsha>, never the release repo.
-#   verify     pull requests, pushes to main and tag pushes. Build, scan and a
+#   verify     pull requests and pushes to any other branch or tag. Build, scan and a
 #              publish dry run against a local registry. Nothing is pushed.
 #
 # Anyone with a workflow in this repository can write tags of the GHCR package,
@@ -23,8 +23,7 @@ name: xs-release
 on:
   push:
     branches:
-      - main
-      - "ci/**"
+      - "**"
     tags:
       - "v*-xs.*"
   pull_request:
@@ -43,10 +42,15 @@ on:
 
 permissions: {}
 
-# Release runs share one group so bursts queue instead of replacing each other.
+# Dispatched releases queue per tag. Rehearsals queue per ref. Verify runs
+# (pull requests, other branches, tags) share one group per branch so a push and
+# its pull request do not both run, and a newer run replaces an older one.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && 'xs-release-publish' || format('xs-release-{0}', github.ref) }}
-  cancel-in-progress: false
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' && format('xs-release-{0}', inputs.tag) ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) && format('xs-release-rehearsal-{0}', github.ref) ||
+        format('xs-release-verify-{0}', github.head_ref || github.ref_name) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) }}
 
 env:
   OIDC_ISSUER: https://token.actions.githubusercontent.com
@@ -199,10 +203,10 @@ jobs:
             exit 0
           fi
           rc=0
-          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}" || rc=$?
+          d="$(.github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}")" || rc=$?
           case "${rc}" in
             0)
-              d="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}")"
+              .github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" "${d}" >/dev/null
               echo "${IMAGE}:${IMAGE_TAG} already exists with trusted provenance (${d}); no rebuild"
               echo "published=true" >> "${GITHUB_OUTPUT}"
               echo "digest=${d}" >> "${GITHUB_OUTPUT}"
@@ -407,9 +411,9 @@ jobs:
       - name: The existence check now sees the tag
         run: |
           set -euo pipefail
-          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}"
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}" >/dev/null
           rc=0
-          .github/scripts/xs-manifest-exists.sh "${IMAGE}:never-published" || rc=$?
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:never-published" >/dev/null || rc=$?
           if [[ "${rc}" != "1" ]]; then
             echo "::error::expected an absent tag to report rc=1, got ${rc}"
             exit 1
@@ -428,7 +432,7 @@ jobs:
 
           echo "== unsigned image: the trust check must reject it"
           rc=0
-          log="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" 2>&1)" || rc=$?
+          log="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" "${DIGEST}" 2>&1)" || rc=$?
           echo "${log}"
           if [[ "${rc}" == "0" ]]; then
             echo "::error::an unsigned image was accepted"

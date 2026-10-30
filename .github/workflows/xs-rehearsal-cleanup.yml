@@ -42,9 +42,14 @@ jobs:
             exit 1
           fi
           count=0
+          failed=0
           while IFS= read -r id; do
             [[ -n "${id}" ]] || continue
-            gh api --method DELETE "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}"
-            count=$((count + 1))
+            if gh api --method DELETE "${path}/${id}" 2>"${err}"; then
+              count=$((count + 1))
+            else
+              failed=$((failed + 1))
+              echo "::warning::could not delete version ${id}: $(tr '\n' ' ' < "${err}")"
+            fi
           done <<<"${versions}"
-          echo "deleted ${count} version(s) older than ${cutoff}"
+          echo "deleted ${count} version(s) older than ${cutoff}, ${failed} failed"

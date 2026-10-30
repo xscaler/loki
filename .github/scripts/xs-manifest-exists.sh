@@ -2,6 +2,7 @@
 # Check whether an image tag exists (needs crane, logged in; gh and GH_TOKEN for ghcr.io).
 #
 # usage: xs-manifest-exists.sh <ref>
+# out:   the manifest digest on stdout when the tag exists.
 # exit:  0 exists, 1 absent, 2 any other error.
 #
 # For ghcr.io references the GitHub Packages API is asked first. A 404 there
@@ -30,7 +31,9 @@ if [[ "${ref}" == ghcr.io/* ]]; then
   fi
 fi
 
-if crane manifest "${ref}" >/dev/null 2>"${err}"; then
+# One registry call: its output is the digest, its stderr classifies a failure.
+if digest="$(crane digest "${ref}" 2>"${err}")"; then
+  echo "${digest}"
   exit 0
 fi
 if grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN' "${err}"; then

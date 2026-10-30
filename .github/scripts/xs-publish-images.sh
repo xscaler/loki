@@ -23,7 +23,7 @@ done
 
 # Last check before the tag is created; a concurrent publisher must not be overwritten.
 rc=0
-"$(dirname "$0")/xs-manifest-exists.sh" "${image}:${tag}" || rc=$?
+"$(dirname "$0")/xs-manifest-exists.sh" "${image}:${tag}" >/dev/null || rc=$?
 if [[ "${rc}" != "1" ]]; then
   echo "::error::${image}:${tag} exists or could not be checked (rc=${rc}); refusing to create it"
   exit 1

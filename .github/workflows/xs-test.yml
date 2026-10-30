@@ -4,6 +4,18 @@
 # Tools installed by upstream's pre-steps come from the pinned loki-release
 # install script; the ones we install ourselves are pinned by version and sha256.
 #
+# Also mirrored: build-loki-binary.yml (cross-build matrix) and lint-jsonnet.yml.
+#
+# Upstream workflows not reproduced (none runs a unit suite we lack):
+#   - logql-correctness.yml, logql-bench.yml: need Grafana's large arm64 runner
+#     and a generated benchmark dataset; they are benchmarks, not the unit suite.
+#   - helm-ci, helm-diff-ci, helm-release: charts live in xscaler/helm-charts.
+#   - nix-ci, operator*: out of scope (nix packaging, operator).
+#   - snyk, relyance, secret-scanning, claude*, labeler, conventional-commits,
+#     backport, release and *-release-pr, images, querytee-images, logql-analyzer,
+#     syft-sbom-ci, deploy-pr-preview: Grafana release, security and docs infra.
+#   - govulncheck: upstream has no govulncheck workflow at v3.7.9.
+#
 # Upstream jobs not reproduced here:
 #   - "build docs website": needs the grafana/docs-base image and Grafana
 #     docs infra; the fork ships no docs site.
@@ -17,16 +29,17 @@ on:
       - main
   push:
     branches:
-      - main
-      - "ci/**"
+      - "**"
   workflow_dispatch: {}
   schedule:
     - cron: "17 3 * * 0"
 
 permissions: {}
 
+# A branch with an open pull request triggers both a push and a pull_request
+# run; they share one group so only one of them survives.
 concurrency:
-  group: xs-test-${{ github.workflow }}-${{ github.ref }}
+  group: xs-test-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -227,6 +240,66 @@ jobs:
         working-directory: pkg/push
         run: gotestsum -- -covermode=atomic -coverprofile=coverage.txt -p=4 ./...
 
+  build-binaries:
+    name: build ${{ matrix.binary.name }} (linux/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64, arm]
+        binary:
+          - { name: loki, path: ./cmd/loki }
+          - { name: logcli, path: ./cmd/logcli }
+          - { name: querytee, path: ./cmd/querytee }
+    env:
+      GOARCH: ${{ matrix.goarch }}
+      BINARY: ${{ matrix.binary.name }}
+      BINARY_PATH: ${{ matrix.binary.path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+        run: go build -v -o "${BINARY}-linux-${GOARCH}" "${BINARY_PATH}"
+
+  lint-jsonnet:
+    name: lint jsonnet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Set up jsonnet tools
+        run: |
+          go install github.com/google/go-jsonnet/cmd/jsonnet@v0.20.0
+          go install github.com/google/go-jsonnet/cmd/jsonnetfmt@v0.20.0
+          go install github.com/google/go-jsonnet/cmd/jsonnet-lint@v0.20.0
+          go install github.com/monitoring-mixins/mixtool/cmd/mixtool@16dc166166d91e93475b86b9355a4faed2400c18
+          go install github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb@v0.5.1
+      - name: Lint
+        run: make BUILD_IN_CONTAINER=false lint-jsonnet
+      - name: Check the compiled mixin is up to date
+        run: make BUILD_IN_CONTAINER=false loki-mixin-check
+
   checks-passed:
     name: checks passed
     runs-on: ubuntu-latest
@@ -236,6 +309,8 @@ jobs:
       - check-files
       - faillint
       - golangci-lint
+      - build-binaries
+      - lint-jsonnet
       - integration
       - test-packages
       - test-push-package
