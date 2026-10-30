@@ -371,7 +371,7 @@ jobs:
   publish-dryrun:
     name: publish dry run (local registry)
     needs: [prepare, build]
-    if: needs.prepare.outputs.mode == 'verify' && needs.build.result == 'success'
+    if: needs.prepare.outputs.mode != 'release' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
