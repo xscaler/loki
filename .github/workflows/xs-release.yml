@@ -568,16 +568,15 @@ jobs:
       - name: Verify provenance and per-platform SBOM attestations
         run: |
           set -euo pipefail
-          signer="${REPOSITORY}/.github/workflows/xs-release.yml"
           echo "== provenance on the index"
           gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${REPOSITORY}" \
-            --signer-workflow "${signer}" --cert-identity "${CERT_IDENTITY}"
+            --cert-identity "${CERT_IDENTITY}"
           manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
           for arch in amd64 arm64; do
             d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
             echo "== SBOM for linux/${arch} (${d})"
             gh attestation verify "oci://${IMAGE}@${d}" --repo "${REPOSITORY}" \
-              --signer-workflow "${signer}" --cert-identity "${CERT_IDENTITY}" \
+              --cert-identity "${CERT_IDENTITY}" \
               --predicate-type https://spdx.dev/Document/v2.3
           done
 

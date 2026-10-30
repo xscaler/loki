@@ -28,7 +28,6 @@ cosign verify "${ref}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
   --certificate-identity "${CERT_IDENTITY}" >/dev/null 2>&1 || fail "no valid signature from ${CERT_IDENTITY}"
 
 gh attestation verify "oci://${ref}" --repo "${REPOSITORY}" \
-  --signer-workflow "${REPOSITORY}/.github/workflows/xs-release.yml" \
   --cert-identity "${CERT_IDENTITY}" >/dev/null 2>&1 || fail "no valid provenance attestation"
 
 manifest="$(crane manifest "${ref}")"
