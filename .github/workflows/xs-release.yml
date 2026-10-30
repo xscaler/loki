@@ -569,6 +569,9 @@ jobs:
           CERT_IDENTITY: ${{ needs.prepare.outputs.cert_identity }}
         run: .github/scripts/xs-ensure-signed.sh "${IMAGE}@${DIGEST}"
 
+  # On the reuse path (a trusted image already exists) build and publish are
+  # skipped. "skipped" propagates through needs, so the conditions below name
+  # the allowed results explicitly instead of relying on the default.
   verify:
     name: verify signatures and version
     needs: [prepare, publish]
@@ -673,6 +676,8 @@ jobs:
   tag:
     name: create release tag
     needs: [prepare, verify]
+    # Runs after verify succeeded, on the fresh and the reuse path alike. It is
+    # skipped for rehearsal and verify runs only because they never tag.
     if: "!cancelled() && needs.verify.result == 'success' && needs.prepare.outputs.mode == 'release'"
     runs-on: ubuntu-latest
     timeout-minutes: 5
