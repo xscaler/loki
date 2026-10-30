@@ -561,6 +561,7 @@ jobs:
             echo "::error::missing platform in ${IMAGE}@${DIGEST}"
             exit 1
           fi
+          docker pull --quiet "${IMAGE}@${DIGEST}" >/dev/null
           out="$(docker run --rm "${IMAGE}@${DIGEST}" -version 2>&1)"
           echo "${out}"
           printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
