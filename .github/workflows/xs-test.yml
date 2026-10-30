@@ -1,6 +1,9 @@
 # xScaler fork: unit tests and lint, mirroring upstream's reusable
 # grafana/loki-release check workflow (pinned below) on GitHub-hosted runners.
 #
+# Tools installed by upstream's pre-steps come from the pinned loki-release
+# install script; the ones we install ourselves are pinned by version and sha256.
+#
 # Upstream jobs not reproduced here:
 #   - "build docs website": needs the grafana/docs-base image and Grafana
 #     docs infra; the fork ships no docs site.
@@ -58,12 +61,7 @@ jobs:
       - name: Install shellcheck
         run: |
           apt-get install -qy tar xz-utils
-          curl -fsSL -o /tmp/shellcheck.tar.xz \
-            https://github.com/koalaman/shellcheck/releases/download/v0.9.0/shellcheck-v0.9.0.linux.x86_64.tar.xz
-          echo "700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f  /tmp/shellcheck.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
-          install -m 0755 /tmp/shellcheck-v0.9.0/shellcheck /usr/local/bin/shellcheck
-          shellcheck --version
+          .github/scripts/xs-install-tool.sh shellcheck
       - name: Check generated files
         run: make check-generated-files
       - name: Check go.mod
@@ -100,6 +98,15 @@ jobs:
           persist-credentials: false
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install build tools (upstream pre-step)
+        run: |
+          curl -fsSL -o /tmp/install_workflow_dependencies.sh \
+            "https://raw.githubusercontent.com/grafana/loki-release/${RELEASE_LIB_REF}/workflows/install_workflow_dependencies.sh"
+          SRC_DIR=/nonexistent sh /tmp/install_workflow_dependencies.sh loki-release loki-build-tools
+      - name: Install shellcheck (upstream pre-step)
+        run: |
+          apt-get install -qy tar xz-utils
+          .github/scripts/xs-install-tool.sh shellcheck
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
@@ -172,7 +179,7 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install gotestsum
-        run: go install gotest.tools/gotestsum@v1.9.0
+        run: .github/scripts/xs-install-tool.sh gotestsum
       - name: Test package
         run: gotestsum -- -tags=assert -covermode=atomic -coverprofile=coverage.txt -p=4 "./${MATRIX_PACKAGE}/..."
 
@@ -212,7 +219,7 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install gotestsum
-        run: go install gotest.tools/gotestsum@v1.9.0
+        run: .github/scripts/xs-install-tool.sh gotestsum
       - name: go mod tidy
         working-directory: pkg/push
         run: go mod tidy

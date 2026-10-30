@@ -1,54 +1,34 @@
 #!/usr/bin/env bash
-# Idempotent cosign keyless signing (and optional SBOM attestation) of an image digest.
+# Idempotent cosign keyless signing of an image digest.
 #
-# usage: xs-ensure-signed.sh <image@sha256:digest> [<sbom.spdx.json>]
-# env:   OIDC_ISSUER, CERT_IDENTITY_REGEXP
+# usage: xs-ensure-signed.sh <image@sha256:digest>
+# env:   OIDC_ISSUER, CERT_IDENTITY (exact certificate identity)
 #
-# Verifies first. Signs only when the registry answers that no signature exists;
-# any other verify failure (auth, network, registry error) fails the job.
+# Verifies first. Signs (recursively, so per-platform manifests are covered)
+# only when the registry answers "no signatures found". Any other verify
+# failure, including a signature from a different identity, fails.
 set -euo pipefail
 
 ref="${1:?image reference with digest required}"
-sbom="${2:-}"
+: "${OIDC_ISSUER:?}" "${CERT_IDENTITY:?}"
 
-: "${OIDC_ISSUER:?}" "${CERT_IDENTITY_REGEXP:?}"
+verify=(cosign verify "${ref}" --certificate-oidc-issuer "${OIDC_ISSUER}"
+  --certificate-identity "${CERT_IDENTITY}")
 
-absent_re='no signatures found|no matching signatures|no attestations found|no matching attestations|MANIFEST_UNKNOWN|NAME_UNKNOWN|NOT_FOUND|404'
+err="$(mktemp)"
+trap 'rm -f "${err}"' EXIT
 
-# ensure <what> <verify-cmd...> -- <create-cmd...>
-ensure() {
-  local what="$1"
-  shift
-  local verify=() create=()
-  while [[ "$#" -gt 0 && "$1" != "--" ]]; do verify+=("$1"); shift; done
-  shift
-  create=("$@")
-
-  local err
-  err="$(mktemp)"
-  if "${verify[@]}" >/dev/null 2>"${err}"; then
-    echo "${what}: already present on ${ref}"
-    return 0
-  fi
-  if ! grep -Eq "${absent_re}" "${err}"; then
-    echo "::error::${what}: verification failed for a reason other than a missing signature:"
-    cat "${err}"
-    return 1
-  fi
-  echo "${what}: not present on ${ref}, creating"
-  "${create[@]}"
-  "${verify[@]}" >/dev/null
-  echo "${what}: created and verified"
-}
-
-ensure "signature" \
-  cosign verify "${ref}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
-  --certificate-identity-regexp "${CERT_IDENTITY_REGEXP}" \
-  -- cosign sign --yes "${ref}"
-
-if [[ -n "${sbom}" ]]; then
-  ensure "SBOM attestation" \
-    cosign verify-attestation "${ref}" --type spdxjson --certificate-oidc-issuer "${OIDC_ISSUER}" \
-    --certificate-identity-regexp "${CERT_IDENTITY_REGEXP}" \
-    -- cosign attest --yes --type spdxjson --predicate "${sbom}" "${ref}"
+if "${verify[@]}" >/dev/null 2>"${err}"; then
+  echo "${ref}: already signed by ${CERT_IDENTITY}"
+  exit 0
 fi
+if ! grep -q 'no signatures found' "${err}"; then
+  echo "::error::signature verification failed for ${ref}:"
+  cat "${err}"
+  exit 1
+fi
+
+echo "${ref}: no signatures found, signing"
+cosign sign --yes --recursive "${ref}"
+"${verify[@]}" >/dev/null
+echo "${ref}: signed and verified"
