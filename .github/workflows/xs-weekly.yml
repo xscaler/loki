@@ -1,6 +1,9 @@
 # xScaler fork: weekly scan of the newest released loki image. When it carries
-# fixable HIGH or CRITICAL findings, cut the next -xs.<n> tag on the same commit
-# and dispatch xs-release so the rebuild picks up patched base images.
+# fixable HIGH or CRITICAL findings, build a candidate from the same commit (no
+# push) and scan it. Only when the rebuild resolves at least one of those
+# findings (compared by vulnerability ID and package) cut the next -xs.<n> tag
+# and dispatch xs-release. Findings the rebuild cannot fix (Go stdlib, modules)
+# need an upstream bump and are listed in the job summary.
 name: xs-weekly
 
 on:
@@ -65,7 +68,7 @@ jobs:
         if: steps.latest.outputs.tag != ''
         env:
           VERSION: ${{ steps.latest.outputs.version }}
-          REPORT: ${{ runner.temp }}/trivy.json
+          REPORT: ${{ runner.temp }}/published.json
         run: |
           set -euo pipefail
           trivy image "${GHCR_IMAGE}:${VERSION}" --ignore-unfixed \
@@ -74,11 +77,99 @@ jobs:
           trivy image "${GHCR_IMAGE}:${VERSION}" --ignore-unfixed \
             --severity HIGH,CRITICAL --format table --exit-code 0 --no-progress
           count="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "${REPORT}")"
-          echo "fixable HIGH/CRITICAL findings: ${count}"
+          echo "fixable HIGH/CRITICAL findings in ${VERSION}: ${count}"
           echo "count=${count}" >> "${GITHUB_OUTPUT}"
+          if [ "${count}" = "0" ]; then
+            echo "### Weekly scan: ${VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "No fixable HIGH or CRITICAL findings. Nothing to do." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.scan.outputs.count != '' && steps.scan.outputs.count != '0'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Check out the released commit
+        if: steps.scan.outputs.count != '' && steps.scan.outputs.count != '0'
+        env:
+          COMMIT: ${{ steps.latest.outputs.commit }}
+        run: git checkout --detach "${COMMIT}"
+
+      - name: Read build parameters
+        id: params
+        if: steps.scan.outputs.count != '' && steps.scan.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          go_version="$(sed -n 's/^GO_VERSION *:= *//p' Makefile)"
+          if [ -z "${go_version}" ]; then
+            echo "::error::GO_VERSION not found in Makefile"
+            exit 1
+          fi
+          echo "go_version=${go_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build candidate image (not pushed)
+        if: steps.scan.outputs.count != '' && steps.scan.outputs.count != '0'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: cmd/loki/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            IMAGE_TAG=${{ steps.latest.outputs.version }}
+            GO_VERSION=${{ steps.params.outputs.go_version }}
+          provenance: false
+          sbom: false
+          push: false
+          outputs: type=docker,dest=${{ runner.temp }}/candidate.tar
+
+      - name: Compare candidate with the published image
+        id: compare
+        if: steps.scan.outputs.count != '' && steps.scan.outputs.count != '0'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          PUBLISHED: ${{ runner.temp }}/published.json
+          CANDIDATE_TAR: ${{ runner.temp }}/candidate.tar
+          CANDIDATE: ${{ runner.temp }}/candidate.json
+        run: |
+          set -euo pipefail
+          trivy image --input "${CANDIDATE_TAR}" --ignore-unfixed \
+            --severity HIGH,CRITICAL --format json --output "${CANDIDATE}" \
+            --exit-code 0 --no-progress
+          # One "<id> <package>" line per fixable finding.
+          keys='[.Results[]?.Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]'
+          jq -r "${keys}" "${PUBLISHED}" > "${RUNNER_TEMP}/published.keys"
+          jq -r "${keys}" "${CANDIDATE}" > "${RUNNER_TEMP}/candidate.keys"
+          comm -23 "${RUNNER_TEMP}/published.keys" "${RUNNER_TEMP}/candidate.keys" > "${RUNNER_TEMP}/resolved.keys"
+          resolved="$(wc -l < "${RUNNER_TEMP}/resolved.keys")"
+          remaining="$(wc -l < "${RUNNER_TEMP}/candidate.keys")"
+          {
+            echo "### Weekly scan: ${VERSION}"
+            echo
+            echo "Published image: $(wc -l < "${RUNNER_TEMP}/published.keys") fixable HIGH/CRITICAL findings."
+            echo "Candidate rebuild from the same commit: ${remaining} findings, ${resolved} resolved."
+            echo
+            if [ "${resolved}" -gt 0 ]; then
+              echo "The rebuild fixes these, so the next -xs tag will be cut:"
+              echo
+              sed 's/^/- /' "${RUNNER_TEMP}/resolved.keys"
+            else
+              echo "The rebuild fixes nothing, so no tag is cut."
+            fi
+            echo
+            if [ "${remaining}" -gt 0 ]; then
+              echo "Findings that remain after a rebuild and need an upstream bump (Go toolchain or modules):"
+              echo
+              sed 's/^/- /' "${RUNNER_TEMP}/candidate.keys"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${resolved}" -gt 0 ]; then
+            echo "fixes=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "fixes=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::rebuild would not fix any finding; ${remaining} need an upstream bump"
+          fi
 
       - name: Tag and dispatch a rebuild
-        if: steps.latest.outputs.tag != '' && steps.scan.outputs.count != '0'
+        if: steps.compare.outputs.fixes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
