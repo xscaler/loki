@@ -1,13 +1,23 @@
 # xScaler fork: build, scan, publish, sign and verify the loki image.
 #
+# How to release (the only publish path):
+#   gh workflow run xs-release.yml --ref main -f tag=v<upstream>-xs.<n> -f commit=<sha>
+# The xs-weekly workflow dispatches the same way. The commit must descend from
+# the upstream release tag v<upstream> and from no newer upstream release tag.
+# The image is published to ghcr.io/xscaler/loki:<upstream>-xs.<n>, signed
+# with the identity of this workflow at refs/heads/main, and the git tag is
+# created only after the image is published and verified.
+#
 # Modes, chosen in the prepare job:
-#   release    push of a v<upstream>-xs.<n> tag, or workflow_dispatch from main.
-#              Publishes ghcr.io/xscaler/loki:<upstream>-xs.<n>. The release
-#              commit must be reachable from main. A dispatch creates the git
-#              tag only after the image is published and verified.
+#   release    workflow_dispatch on main. The only mode that publishes a release.
 #   rehearsal  push to a ci/** branch. Runs the same publish path against
 #              ghcr.io/xscaler/rehearsal/loki:<shortsha>, never the release repo.
-#   verify     pull requests and pushes to main. Build and scan only.
+#   verify     pull requests, pushes to main and tag pushes. Build, scan and a
+#              publish dry run against a local registry. Nothing is pushed.
+#
+# Anyone with a workflow in this repository can write tags of the GHCR package,
+# so an existing tag is never trusted: it is reused only with a valid signature
+# and provenance from the exact release identity and a matching revision label.
 name: xs-release
 
 on:
@@ -27,14 +37,15 @@ on:
         required: true
         type: string
       commit:
-        description: "Commit to build (full sha). Empty means the commit of the existing tag."
-        required: false
+        description: "Commit to build (full sha)"
+        required: true
         type: string
 
 permissions: {}
 
+# Release runs share one group so bursts queue instead of replacing each other.
 concurrency:
-  group: xs-release-${{ inputs.tag || github.ref_name }}
+  group: ${{ github.event_name == 'workflow_dispatch' && 'xs-release-publish' || format('xs-release-{0}', github.ref) }}
   cancel-in-progress: false
 
 env:
@@ -71,59 +82,56 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_COMMIT: ${{ inputs.commit }}
           SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag=""
-          commit="${SHA}"
+          identity="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@${REF}"
+
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             if [[ "${REF}" != "refs/heads/main" ]]; then
               echo "::error::releases can only be dispatched from main (ref is ${REF})"
               exit 1
             fi
             tag="${INPUT_TAG}"
-            commit=""
-          elif [[ "${EVENT_NAME}" == "push" && "${REF_TYPE}" == "tag" ]]; then
-            tag="${REF_NAME}"
-          fi
-
-          identity="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@${REF}"
-
-          if [[ -n "${tag}" ]]; then
-            if [[ "${tag}" == *$'\n'* ]] || ! [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-xs\.(0|[1-9][0-9]*)$ ]]; then
+            commit="${INPUT_COMMIT}"
+            if [[ "${tag}" == *$'\n'* ]] || ! [[ "${tag}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-xs\.(0|[1-9][0-9]*)$ ]]; then
               echo "::error::tag does not match v<upstream-version>-xs.<n>"
               exit 1
             fi
-            if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-              if [[ -n "${INPUT_COMMIT}" ]]; then
-                if [[ "${INPUT_COMMIT}" == *$'\n'* ]] || ! [[ "${INPUT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
-                  echo "::error::commit must be a full 40 character sha"
-                  exit 1
-                fi
-                commit="${INPUT_COMMIT}"
-              fi
-              if existing="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}")"; then
-                if [[ -z "${commit}" ]]; then
-                  commit="${existing}"
-                elif [[ "${commit}" != "${existing}" ]]; then
-                  echo "::error::tag ${tag} points at ${existing}, not ${commit}"
-                  exit 1
-                fi
-              elif [[ -z "${commit}" ]]; then
-                echo "::error::tag ${tag} does not exist; pass the commit input"
-                exit 1
-              fi
+            upstream="v${BASH_REMATCH[1]}"
+            if [[ "${commit}" == *$'\n'* ]] || ! [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::commit must be a full 40 character sha"
+              exit 1
             fi
             git cat-file -e "${commit}^{commit}"
             if ! git merge-base --is-ancestor "${commit}" origin/main; then
               echo "::error::release commit ${commit} is not an ancestor of origin/main"
               exit 1
             fi
+
+            # Version integrity: the commit must descend from the upstream release tag
+            # and from no newer upstream release tag.
+            if ! git rev-parse --verify --quiet "refs/tags/${upstream}^{commit}" >/dev/null; then
+              echo "::error::upstream release tag ${upstream} does not exist"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${upstream}" "${commit}"; then
+              echo "::error::${upstream} is not an ancestor of ${commit}"
+              exit 1
+            fi
+            while IFS= read -r t; do
+              if [[ "${t}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "${t}" != "${upstream}" ]]; then
+                newest="$(printf '%s\n%s\n' "${upstream}" "${t}" | LC_ALL=C sort -V | tail -n1)"
+                if [[ "${newest}" == "${t}" ]] && git merge-base --is-ancestor "${t}" "${commit}"; then
+                  echo "::error::newer upstream release ${t} is an ancestor of ${commit}; release ${t#v} instead"
+                  exit 1
+                fi
+              fi
+            done < <(git tag --list 'v*')
+
             version="${tag#v}"
             {
               echo "mode=release"
@@ -159,9 +167,11 @@ jobs:
             } >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Install crane
+      - name: Install crane and cosign
         if: steps.meta.outputs.mode != 'verify'
-        run: .github/scripts/xs-install-tool.sh crane
+        run: |
+          set -euo pipefail
+          for t in crane cosign; do .github/scripts/xs-install-tool.sh "${t}"; done
 
       - name: Log in to GHCR
         if: steps.meta.outputs.mode != 'verify'
@@ -171,12 +181,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check whether this image is already published
+      - name: Check whether this tag already exists and can be trusted
         id: published
         env:
           MODE: ${{ steps.meta.outputs.mode }}
           IMAGE: ${{ steps.meta.outputs.image }}
           IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          CERT_IDENTITY: ${{ steps.meta.outputs.cert_identity }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ "${MODE}" == "verify" ]]; then
@@ -188,8 +202,8 @@ jobs:
           .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}" || rc=$?
           case "${rc}" in
             0)
-              d="$(crane digest "${IMAGE}:${IMAGE_TAG}")"
-              echo "${IMAGE}:${IMAGE_TAG} already exists (${d}); reusing it, no rebuild"
+              d="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}")"
+              echo "${IMAGE}:${IMAGE_TAG} already exists with trusted provenance (${d}); no rebuild"
               echo "published=true" >> "${GITHUB_OUTPUT}"
               echo "digest=${d}" >> "${GITHUB_OUTPUT}"
               ;;
@@ -219,7 +233,6 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
-      MODE: ${{ needs.prepare.outputs.mode }}
     steps:
       # The workflow's own commit supplies the scripts; the release commit is
       # checked out separately and is only the source tree that gets built.
@@ -315,7 +328,6 @@ jobs:
             --exit-code 1 --no-progress
 
       - name: Upload image tarball
-        if: env.MODE != 'verify'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loki-${{ matrix.arch }}
@@ -353,12 +365,80 @@ jobs:
           sarif_file: ${{ runner.temp }}/sarif/sarif-arm64/trivy-arm64.sarif
           category: trivy-loki-arm64
 
+  # Publish dry run for pull requests, main and tag pushes: the same script that
+  # publishes for real runs against a local registry. Only signing and
+  # attestation are skipped, they need an OIDC identity.
+  publish-dryrun:
+    name: publish dry run (local registry)
+    needs: [prepare, build]
+    if: needs.prepare.outputs.mode == 'verify' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    env:
+      IMAGE: localhost:5000/loki
+      IMAGE_TAG: dryrun
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout workflow files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install crane
+        run: .github/scripts/xs-install-tool.sh crane
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: loki-*
+          path: ${{ runner.temp }}/images
+
+      - name: Push by digest and create the index
+        id: index
+        run: .github/scripts/xs-publish-images.sh "${IMAGE}" "${IMAGE_TAG}" "${RUNNER_TEMP}/images"
+
+      - name: The existence check now sees the tag
+        run: |
+          set -euo pipefail
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}"
+          rc=0
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:never-published" || rc=$?
+          if [[ "${rc}" != "1" ]]; then
+            echo "::error::expected an absent tag to report rc=1, got ${rc}"
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Run both platform binaries from the registry
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker pull --quiet --platform "linux/${arch}" "${IMAGE}@${DIGEST}" >/dev/null
+            out="$(docker run --rm --platform "linux/${arch}" "${IMAGE}@${DIGEST}" -version 2>&1)"
+            echo "${out}"
+            printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
+              echo "::error::linux/${arch} binary does not report ${VERSION}"
+              exit 1
+            }
+          done
+
   publish:
     name: publish to GHCR
     needs: [prepare, build]
     if: >-
       !cancelled() && needs.prepare.outputs.mode != 'verify' &&
-      (needs.build.result == 'success' || needs.prepare.outputs.published == 'true')
+      needs.prepare.outputs.published != 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ${{ needs.prepare.outputs.environment }}
@@ -372,8 +452,7 @@ jobs:
     env:
       IMAGE: ${{ needs.prepare.outputs.image }}
       IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-      ALREADY_PUBLISHED: ${{ needs.prepare.outputs.published }}
-      PUBLISHED_DIGEST: ${{ needs.prepare.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout workflow files
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -393,7 +472,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download image tarballs
-        if: env.ALREADY_PUBLISHED != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: loki-*
@@ -401,55 +479,7 @@ jobs:
 
       - name: Push per-arch images by digest and create the index
         id: index
-        env:
-          IMAGES_DIR: ${{ runner.temp }}/images
-          METADATA: ${{ runner.temp }}/index-metadata.json
-        run: |
-          set -euo pipefail
-          if [[ "${ALREADY_PUBLISHED}" == "true" ]]; then
-            echo "digest=${PUBLISHED_DIGEST}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          refs=()
-          for arch in amd64 arm64; do
-            tar="${IMAGES_DIR}/loki-${arch}/loki-${arch}.tar"
-            d="$(crane digest --tarball "${tar}")"
-            crane push "${tar}" "${IMAGE}@${d}"
-            echo "${arch}: ${d}"
-            refs+=("${IMAGE}@${d}")
-          done
-          # Last check before the tag is created; a concurrent publisher must not be overwritten.
-          rc=0
-          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}" || rc=$?
-          if [[ "${rc}" != "1" ]]; then
-            echo "::error::${IMAGE}:${IMAGE_TAG} exists or could not be checked (rc=${rc}); refusing to create it"
-            exit 1
-          fi
-          docker buildx imagetools create --metadata-file "${METADATA}" \
-            --tag "${IMAGE}:${IMAGE_TAG}" "${refs[@]}"
-          d="$(jq -r '."containerimage.descriptor".digest' "${METADATA}")"
-          if [[ ! "${d}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::could not read the index digest from the create output"
-            exit 1
-          fi
-          echo "digest=${d}" >> "${GITHUB_OUTPUT}"
-          echo "${IMAGE}:${IMAGE_TAG} -> ${d}"
-
-      - name: Resolve per-platform digests
-        id: platforms
-        env:
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: |
-          set -euo pipefail
-          manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
-          for arch in amd64 arm64; do
-            d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
-            if [[ ! "${d}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::no linux/${arch} manifest in ${IMAGE}@${DIGEST}"
-              exit 1
-            fi
-            echo "${arch}=${d}" >> "${GITHUB_OUTPUT}"
-          done
+        run: .github/scripts/xs-publish-images.sh "${IMAGE}" "${IMAGE_TAG}" "${RUNNER_TEMP}/images"
 
       - name: Attest build provenance (index)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -460,8 +490,8 @@ jobs:
 
       - name: Generate SBOMs (one per platform image)
         env:
-          AMD64: ${{ steps.platforms.outputs.amd64 }}
-          ARM64: ${{ steps.platforms.outputs.arm64 }}
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
         run: |
           set -euo pipefail
           syft "${IMAGE}@${AMD64}" -o "spdx-json=${RUNNER_TEMP}/sbom-amd64.spdx.json"
@@ -471,7 +501,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.platforms.outputs.amd64 }}
+          subject-digest: ${{ steps.index.outputs.amd64 }}
           sbom-path: ${{ runner.temp }}/sbom-amd64.spdx.json
           push-to-registry: true
 
@@ -479,11 +509,11 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.platforms.outputs.arm64 }}
+          subject-digest: ${{ steps.index.outputs.arm64 }}
           sbom-path: ${{ runner.temp }}/sbom-arm64.spdx.json
           push-to-registry: true
 
-      - name: Sign the index with cosign (keyless, idempotent)
+      - name: Sign the index with cosign (keyless)
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
           CERT_IDENTITY: ${{ needs.prepare.outputs.cert_identity }}
@@ -492,7 +522,10 @@ jobs:
   verify:
     name: verify signatures and version
     needs: [prepare, publish]
-    if: "!cancelled() && needs.publish.result == 'success'"
+    if: >-
+      !cancelled() && needs.prepare.outputs.mode != 'verify' &&
+      (needs.publish.result == 'success' ||
+       (needs.publish.result == 'skipped' && needs.prepare.outputs.published == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -502,8 +535,9 @@ jobs:
       IMAGE: ${{ needs.prepare.outputs.image }}
       IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
-      DIGEST: ${{ needs.publish.outputs.digest }}
+      DIGEST: ${{ needs.publish.outputs.digest || needs.prepare.outputs.digest }}
       CERT_IDENTITY: ${{ needs.prepare.outputs.cert_identity }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -537,17 +571,17 @@ jobs:
           signer="${REPOSITORY}/.github/workflows/xs-release.yml"
           echo "== provenance on the index"
           gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${REPOSITORY}" \
-            --signer-workflow "${signer}"
+            --signer-workflow "${signer}" --cert-identity "${CERT_IDENTITY}"
           manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
           for arch in amd64 arm64; do
             d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
             echo "== SBOM for linux/${arch} (${d})"
             gh attestation verify "oci://${IMAGE}@${d}" --repo "${REPOSITORY}" \
-              --signer-workflow "${signer}" \
+              --signer-workflow "${signer}" --cert-identity "${CERT_IDENTITY}" \
               --predicate-type https://spdx.dev/Document/v2.3
           done
 
-      - name: Verify the tag, platforms and the reported version
+      - name: Verify the tag, platforms and revision labels
         run: |
           set -euo pipefail
           got="$(crane digest "${IMAGE}:${IMAGE_TAG}")"
@@ -555,27 +589,42 @@ jobs:
             echo "::error::${IMAGE}:${IMAGE_TAG} resolves to ${got}, expected ${DIGEST}"
             exit 1
           fi
-          platforms="$(crane manifest "${IMAGE}@${DIGEST}" | jq -r '[.manifests[] | "\(.platform.os)/\(.platform.architecture)"] | sort | join(" ")')"
-          echo "platforms: ${platforms}"
-          if [[ "${platforms}" != *"linux/amd64"* || "${platforms}" != *"linux/arm64"* ]]; then
-            echo "::error::missing platform in ${IMAGE}@${DIGEST}"
-            exit 1
-          fi
-          docker pull --quiet "${IMAGE}@${DIGEST}" >/dev/null
-          out="$(docker run --rm "${IMAGE}@${DIGEST}" -version 2>&1)"
-          echo "${out}"
-          printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
-            echo "::error::${IMAGE} reports a different version than ${VERSION}"
-            exit 1
-          }
+          manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
+          for arch in amd64 arm64; do
+            d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
+            if [[ ! "${d}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::missing linux/${arch} in ${IMAGE}@${DIGEST}"
+              exit 1
+            fi
+            rev="$(crane config "${IMAGE}@${d}" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')"
+            if [[ "${rev}" != "${COMMIT}" ]]; then
+              echo "::error::linux/${arch} revision label is '${rev}', expected ${COMMIT}"
+              exit 1
+            fi
+          done
 
-  # A dispatched release has no git tag yet. Create it only now that the image
-  # is published and verified. Tags created with GITHUB_TOKEN do not start
-  # another run.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Run both platform binaries and check the reported version
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker pull --quiet --platform "linux/${arch}" "${IMAGE}@${DIGEST}" >/dev/null
+            out="$(docker run --rm --platform "linux/${arch}" "${IMAGE}@${DIGEST}" -version 2>&1)"
+            echo "${out}"
+            printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
+              echo "::error::linux/${arch} binary does not report ${VERSION}"
+              exit 1
+            }
+          done
+
+  # The git tag is created only now that the image is published and verified.
+  # Tags created with GITHUB_TOKEN do not start another run.
   tag:
     name: create release tag
     needs: [prepare, verify]
-    if: "!cancelled() && needs.verify.result == 'success' && github.event_name == 'workflow_dispatch' && needs.prepare.outputs.mode == 'release'"
+    if: "!cancelled() && needs.verify.result == 'success' && needs.prepare.outputs.mode == 'release'"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -586,12 +635,26 @@ jobs:
       TAG: ${{ needs.prepare.outputs.tag }}
       COMMIT: ${{ needs.prepare.outputs.commit }}
     steps:
-      - name: Create the tag if it does not exist
+      - name: Create the tag, or confirm the existing one points at the release commit
         run: |
           set -euo pipefail
-          if existing="$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null)"; then
-            echo "tag ${TAG} already exists (${existing})"
-            exit 0
+          err="$(mktemp)"
+          if obj="$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha' 2>"${err}")"; then
+            type="${obj% *}"
+            sha="${obj#* }"
+            if [[ "${type}" == "tag" ]]; then
+              sha="$(gh api "repos/${REPOSITORY}/git/tags/${sha}" --jq .object.sha)"
+            fi
+            if [[ "${sha}" != "${COMMIT}" ]]; then
+              echo "::error::tag ${TAG} points at ${sha}, not the release commit ${COMMIT}"
+              exit 1
+            fi
+            echo "tag ${TAG} already points at ${COMMIT}"
+          elif grep -q 'HTTP 404' "${err}"; then
+            gh api --method POST "repos/${REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${TAG}" -f "sha=${COMMIT}"
+          else
+            echo "::error::could not look up tag ${TAG}:"
+            cat "${err}"
+            exit 1
           fi
-          gh api --method POST "repos/${REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${TAG}" -f "sha=${COMMIT}"

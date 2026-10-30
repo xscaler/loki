@@ -60,6 +60,8 @@ jobs:
 
       - name: Pick the highest tag whose image exists
         id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export LC_ALL=C
@@ -191,6 +193,8 @@ jobs:
           jq -r '[.Results[]?.Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
             "${RUNNER_TEMP}/candidate.json" | sort -u > "${RUNNER_TEMP}/candidate.keys"
           echo "candidate linux/${ARCH}: $(wc -l < "${RUNNER_TEMP}/candidate.keys") fixable HIGH/CRITICAL findings"
+          jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' \
+            "${RUNNER_TEMP}/candidate.json" > "${RUNNER_TEMP}/candidate.critical"
 
       - name: Keep the finding sets
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -199,6 +203,7 @@ jobs:
           path: |
             ${{ runner.temp }}/published.keys
             ${{ runner.temp }}/candidate.keys
+            ${{ runner.temp }}/candidate.critical
           retention-days: 1
           if-no-files-found: error
 
@@ -230,6 +235,7 @@ jobs:
           export LC_ALL=C
           resolved_total=0
           published_total=0
+          critical_total=0
           {
             echo "### Weekly scan: ${VERSION}"
             echo
@@ -240,7 +246,8 @@ jobs:
             dir="${RUNNER_TEMP}/keys/keys-${arch}"
             published="$(wc -l < "${dir}/published.keys")"
             resolved="$(comm -23 "${dir}/published.keys" "${dir}/candidate.keys")"
-            resolved_n="$(printf '%s' "${resolved}" | grep -c . || true)"
+            resolved_n="$(printf '%s\n' "${resolved}" | awk 'NF { n++ } END { print n + 0 }')"
+            critical_total=$((critical_total + $(<"${dir}/candidate.critical")))
             published_total=$((published_total + published))
             resolved_total=$((resolved_total + resolved_n))
             echo "linux/${arch}: published ${published}, resolved by rebuild ${resolved_n}" >> "${GITHUB_STEP_SUMMARY}"
@@ -256,7 +263,7 @@ jobs:
           fi
           if [[ "${resolved_total}" -gt 0 ]]; then
             {
-              echo "The rebuild fixes these, so ${NEXT_TAG} is dispatched:"
+              echo "The rebuild fixes these:"
               echo
               printf '%s' "${resolved_all}" | grep . | sed 's/^/- /'
               echo
@@ -271,6 +278,13 @@ jobs:
               echo
               printf '%s' "${remaining_all}" | grep . | sed 's/^/- /'
             } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [[ "${critical_total}" -gt 0 ]]; then
+            {
+              echo
+              echo "The candidate still has ${critical_total} fixable CRITICAL finding(s). The release gate would fail, so ${NEXT_TAG} is not dispatched."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
           fi
           if [[ "${resolved_total}" -gt 0 ]]; then
             gh workflow run xs-release.yml --repo "${REPOSITORY}" --ref main \

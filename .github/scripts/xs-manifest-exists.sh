@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
-# Check whether an image reference exists in a registry (needs crane, logged in).
+# Check whether an image tag exists (needs crane, logged in; gh and GH_TOKEN for ghcr.io).
 #
 # usage: xs-manifest-exists.sh <ref>
 # exit:  0 exists, 1 absent, 2 any other error.
-# Only MANIFEST_UNKNOWN and NAME_UNKNOWN count as absent.
+#
+# For ghcr.io references the GitHub Packages API is asked first. A 404 there
+# means the package does not exist yet, so the tag is absent. Only then is the
+# tag looked up with crane, where only MANIFEST_UNKNOWN and NAME_UNKNOWN count
+# as absent. Any other answer is an error.
 set -uo pipefail
 
 ref="${1:?image reference required}"
 err="$(mktemp)"
 trap 'rm -f "${err}"' EXIT
+
+if [[ "${ref}" == ghcr.io/* ]]; then
+  path="${ref#ghcr.io/}"
+  path="${path%:*}"
+  owner="${path%%/*}"
+  name="${path#*/}"
+  encoded="${name//\//%2F}"
+  if ! gh api "orgs/${owner}/packages/container/${encoded}" >/dev/null 2>"${err}"; then
+    if grep -q 'HTTP 404' "${err}"; then
+      exit 1
+    fi
+    echo "::error::could not look up package ${owner}/${name}:" >&2
+    cat "${err}" >&2
+    exit 2
+  fi
+fi
 
 if crane manifest "${ref}" >/dev/null 2>"${err}"; then
   exit 0

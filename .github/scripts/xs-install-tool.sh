@@ -77,4 +77,9 @@ esac
 sudo=""
 if [[ "$(id -u)" != "0" ]]; then sudo="sudo"; fi
 ${sudo} install -m 0755 "${tmp}/${member}" "/usr/local/bin/${tool}"
-"${tool}" --version 2>&1 | head -n1 || true
+case "${tool}" in
+  crane | cosign) version_cmd=version ;;
+  *) version_cmd=--version ;;
+esac
+installed="$("${tool}" "${version_cmd}" 2>&1)"
+echo "${installed}" | sed -n '1p'

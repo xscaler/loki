@@ -1,0 +1,50 @@
+# Delete rehearsal image package versions older than 14 days. Rehearsal runs
+# (pushes to ci/** branches) publish to ghcr.io/xscaler/rehearsal/loki.
+name: xs-rehearsal-cleanup
+
+on:
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: xs-rehearsal-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: delete old rehearsal versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write # delete package versions
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OWNER: ${{ github.repository_owner }}
+      PACKAGE: rehearsal%2Floki
+    steps:
+      - name: Delete versions older than 14 days
+        run: |
+          set -euo pipefail
+          err="$(mktemp)"
+          cutoff="$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          path="orgs/${OWNER}/packages/container/${PACKAGE}/versions"
+          filter=".[] | select(.updated_at < \"${cutoff}\") | .id"
+          versions=""
+          if ! versions="$(gh api --paginate "${path}?per_page=100" --jq "${filter}" 2>"${err}")"; then
+            if grep -q 'HTTP 404' "${err}"; then
+              echo "package does not exist, nothing to clean"
+              exit 0
+            fi
+            cat "${err}"
+            exit 1
+          fi
+          count=0
+          while IFS= read -r id; do
+            [[ -n "${id}" ]] || continue
+            gh api --method DELETE "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}"
+            count=$((count + 1))
+          done <<<"${versions}"
+          echo "deleted ${count} version(s) older than ${cutoff}"
