@@ -415,6 +415,56 @@ jobs:
             exit 1
           fi
 
+      - name: Existing tags without trusted provenance are rejected
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+          COSIGN_ALLOW_INSECURE_REGISTRY: "true"
+        run: |
+          set -euo pipefail
+          .github/scripts/xs-install-tool.sh cosign
+          export CERT_IDENTITY="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@refs/heads/main"
+
+          echo "== unsigned image: the trust check must reject it"
+          rc=0
+          log="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" 2>&1)" || rc=$?
+          echo "${log}"
+          if [[ "${rc}" == "0" ]]; then
+            echo "::error::an unsigned image was accepted"
+            exit 1
+          fi
+          grep -q 'exists without trusted provenance' <<<"${log}"
+          grep -q 'no valid signature' <<<"${log}"
+          if grep -qi 'signing' <<<"${log}"; then
+            echo "::error::the trust check attempted to sign"
+            exit 1
+          fi
+
+          echo "== still unsigned afterwards (nothing was signed)"
+          out="$(cosign verify "${IMAGE}@${DIGEST}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            --certificate-identity "${CERT_IDENTITY}" 2>&1)" && {
+            echo "::error::image became signed"
+            exit 1
+          }
+          grep -q 'no signatures found' <<<"${out}"
+          echo "${out}" | grep 'no signatures found'
+
+          echo "== revision label check: matching commit passes"
+          .github/scripts/xs-check-revision-labels.sh "${IMAGE}" "${DIGEST}" "${COMMIT}"
+
+          echo "== revision label check: a different commit is rejected"
+          wrong="0000000000000000000000000000000000000000"
+          rc=0
+          log="$(.github/scripts/xs-check-revision-labels.sh "${IMAGE}" "${DIGEST}" "${wrong}" 2>&1)" || rc=$?
+          echo "${log}"
+          if [[ "${rc}" == "0" ]]; then
+            echo "::error::a mismatching revision label was accepted"
+            exit 1
+          fi
+          grep -q 'exists without trusted provenance' <<<"${log}"
+          grep -q 'revision label' <<<"${log}"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 

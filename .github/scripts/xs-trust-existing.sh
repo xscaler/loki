@@ -9,6 +9,10 @@
 # the registry content is never trusted on its own. The image is accepted only
 # with a cosign signature and a provenance attestation from the exact release
 # identity, and with every platform image labelled with the requested commit.
+# The label check lives in xs-check-revision-labels.sh so CI can exercise it
+# against a local registry; the signature and attestation checks need GHCR and
+# the GitHub attestation API, but the "no signatures found" rejection is
+# exercised locally too.
 set -euo pipefail
 
 image="${1:?image required}"
@@ -30,12 +34,7 @@ cosign verify "${ref}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
 gh attestation verify "oci://${ref}" --repo "${REPOSITORY}" \
   --cert-identity "${CERT_IDENTITY}" >/dev/null 2>&1 || fail "no valid provenance attestation"
 
-manifest="$(crane manifest "${ref}")"
-for arch in amd64 arm64; do
-  d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
-  [[ "${d}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "no linux/${arch} image"
-  rev="$(crane config "${image}@${d}" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')"
-  [[ "${rev}" == "${commit}" ]] || fail "linux/${arch} revision label is '${rev}', expected ${commit}"
-done
+"$(dirname "$0")/xs-check-revision-labels.sh" "${image}" "${digest}" "${commit}" \
+  || fail "revision label check failed"
 
 echo "${digest}"
