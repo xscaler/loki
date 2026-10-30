@@ -47,7 +47,7 @@ permissions: {}
 # its pull request do not both run, and a newer run replaces an older one.
 concurrency:
   group: >-
-    ${{ github.event_name == 'workflow_dispatch' && format('xs-release-{0}', inputs.tag) ||
+    ${{ github.event_name == 'workflow_dispatch' && format('xs-release-{0}-{1}', github.ref, inputs.tag) ||
         (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) && format('xs-release-rehearsal-{0}', github.ref) ||
         format('xs-release-verify-{0}', github.head_ref || github.ref_name) }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) }}
@@ -343,7 +343,7 @@ jobs:
   # hold security-events: write. Pull requests do not upload.
   sarif:
     name: upload Trivy SARIF
-    needs: build
+    needs: [prepare, build]
     if: "!cancelled() && github.event_name != 'pull_request' && needs.build.result != 'skipped'"
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -362,12 +362,16 @@ jobs:
         with:
           sarif_file: ${{ runner.temp }}/sarif/sarif-amd64/trivy-amd64.sarif
           category: trivy-loki-amd64
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
 
       - name: Upload arm64
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: ${{ runner.temp }}/sarif/sarif-arm64/trivy-arm64.sarif
           category: trivy-loki-arm64
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
 
   # Publish dry run for pull requests, main and tag pushes: the same script that
   # publishes for real runs against a local registry. Only signing and
@@ -438,8 +442,8 @@ jobs:
             echo "::error::an unsigned image was accepted"
             exit 1
           fi
-          grep -q 'exists without trusted provenance' <<<"${log}"
-          grep -q 'no valid signature' <<<"${log}"
+          grep -q 'exists without trusted provenance' <<<"${log}" || { echo "::error::rejection message missing"; exit 1; }
+          grep -q 'no valid signature' <<<"${log}" || { echo "::error::signature rejection reason missing"; exit 1; }
           if grep -qi 'signing' <<<"${log}"; then
             echo "::error::the trust check attempted to sign"
             exit 1
@@ -451,7 +455,7 @@ jobs:
             echo "::error::image became signed"
             exit 1
           }
-          grep -q 'no signatures found' <<<"${out}"
+          grep -q 'no signatures found' <<<"${out}" || { echo "::error::unexpected cosign answer: ${out}"; exit 1; }
           echo "${out}" | grep 'no signatures found'
 
           echo "== revision label check: matching commit passes"
@@ -466,8 +470,8 @@ jobs:
             echo "::error::a mismatching revision label was accepted"
             exit 1
           fi
-          grep -q 'exists without trusted provenance' <<<"${log}"
-          grep -q 'revision label' <<<"${log}"
+          grep -q 'exists without trusted provenance' <<<"${log}" || { echo "::error::rejection message missing"; exit 1; }
+          grep -q 'revision label' <<<"${log}" || { echo "::error::label rejection reason missing"; exit 1; }
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -674,6 +678,15 @@ jobs:
               exit 1
             }
           done
+
+      - name: The release tag still resolves to the verified digest
+        run: |
+          set -euo pipefail
+          got="$(crane digest "${IMAGE}:${IMAGE_TAG}")"
+          if [[ "${got}" != "${DIGEST}" ]]; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} moved to ${got} during verification, expected ${DIGEST}"
+            exit 1
+          fi
 
   # The git tag is created only now that the image is published and verified.
   # Tags created with GITHUB_TOKEN do not start another run.
