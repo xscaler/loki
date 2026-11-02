@@ -1,0 +1,731 @@
+# xScaler fork: build, scan, publish, sign and verify the loki image.
+#
+# How to release (the only publish path):
+#   gh workflow run xs-release.yml --ref main -f tag=v<upstream>-xs.<n> -f commit=<sha>
+# The xs-weekly workflow dispatches the same way. The commit must descend from
+# the upstream release tag v<upstream> and from no newer upstream release tag.
+# The image is published to ghcr.io/xscaler/loki:<upstream>-xs.<n>, signed
+# with the identity of this workflow at refs/heads/main, and the git tag is
+# created only after the image is published and verified.
+#
+# Modes, chosen in the prepare job:
+#   release    workflow_dispatch on main. The only mode that publishes a release.
+#   rehearsal  push to a ci/** branch. Runs the same publish path against
+#              ghcr.io/xscaler/rehearsal/loki:<shortsha>, never the release repo.
+#   verify     pull requests and pushes to any other branch or tag. Build, scan and a
+#              publish dry run against a local registry. Nothing is pushed.
+#
+# Anyone with a workflow in this repository can write tags of the GHCR package,
+# so an existing tag is never trusted: it is reused only with a valid signature
+# and provenance from the exact release identity and a matching revision label.
+name: xs-release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*-xs.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, for example v3.7.9-xs.0"
+        required: true
+        type: string
+      commit:
+        description: "Commit to build (full sha)"
+        required: true
+        type: string
+
+permissions: {}
+
+# Dispatched releases queue per tag. Rehearsals queue per ref. Verify runs
+# (pull requests, other branches, tags) share one group per branch so a push and
+# its pull request do not both run, and a newer run replaces an older one.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' && format('xs-release-{0}-{1}', github.ref, inputs.tag) ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) && format('xs-release-rehearsal-{0}', github.ref) ||
+        format('xs-release-verify-{0}', github.head_ref || github.ref_name) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/')) }}
+
+env:
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      mode: ${{ steps.meta.outputs.mode }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      image: ${{ steps.meta.outputs.image }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      environment: ${{ steps.meta.outputs.environment }}
+      cert_identity: ${{ steps.meta.outputs.cert_identity }}
+      published: ${{ steps.published.outputs.published }}
+      digest: ${{ steps.published.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve mode, version and release commit
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@${REF}"
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${REF}" != "refs/heads/main" ]]; then
+              echo "::error::releases can only be dispatched from main (ref is ${REF})"
+              exit 1
+            fi
+            tag="${INPUT_TAG}"
+            commit="${INPUT_COMMIT}"
+            if [[ "${tag}" == *$'\n'* ]] || ! [[ "${tag}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-xs\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::tag does not match v<upstream-version>-xs.<n>"
+              exit 1
+            fi
+            upstream="v${BASH_REMATCH[1]}"
+            if [[ "${commit}" == *$'\n'* ]] || ! [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::commit must be a full 40 character sha"
+              exit 1
+            fi
+            git cat-file -e "${commit}^{commit}"
+            if ! git merge-base --is-ancestor "${commit}" origin/main; then
+              echo "::error::release commit ${commit} is not an ancestor of origin/main"
+              exit 1
+            fi
+
+            # Version integrity: the commit must descend from the upstream release tag
+            # and from no newer upstream release tag.
+            if ! git rev-parse --verify --quiet "refs/tags/${upstream}^{commit}" >/dev/null; then
+              echo "::error::upstream release tag ${upstream} does not exist"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${upstream}" "${commit}"; then
+              echo "::error::${upstream} is not an ancestor of ${commit}"
+              exit 1
+            fi
+            while IFS= read -r t; do
+              if [[ "${t}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "${t}" != "${upstream}" ]]; then
+                newest="$(printf '%s\n%s\n' "${upstream}" "${t}" | LC_ALL=C sort -V | tail -n1)"
+                if [[ "${newest}" == "${t}" ]] && git merge-base --is-ancestor "${t}" "${commit}"; then
+                  echo "::error::newer upstream release ${t} is an ancestor of ${commit}; release ${t#v} instead"
+                  exit 1
+                fi
+              fi
+            done < <(git tag --list 'v*')
+
+            version="${tag#v}"
+            {
+              echo "mode=release"
+              echo "tag=${tag}"
+              echo "version=${version}"
+              echo "commit=${commit}"
+              echo "image=ghcr.io/xscaler/loki"
+              echo "image_tag=${version}"
+              echo "environment=release"
+              echo "cert_identity=${identity}"
+            } >> "${GITHUB_OUTPUT}"
+          elif [[ "${EVENT_NAME}" == "push" && "${REF}" == refs/heads/ci/* ]]; then
+            {
+              echo "mode=rehearsal"
+              echo "tag="
+              echo "version=rehearsal-${SHA:0:7}"
+              echo "commit=${SHA}"
+              echo "image=ghcr.io/xscaler/rehearsal/loki"
+              echo "image_tag=${SHA:0:7}"
+              echo "environment=rehearsal"
+              echo "cert_identity=${identity}"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            {
+              echo "mode=verify"
+              echo "tag="
+              echo "version=verify-${SHA:0:7}"
+              echo "commit=${SHA}"
+              echo "image="
+              echo "image_tag="
+              echo "environment="
+              echo "cert_identity="
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install crane and cosign
+        if: steps.meta.outputs.mode != 'verify'
+        run: |
+          set -euo pipefail
+          for t in crane cosign; do .github/scripts/xs-install-tool.sh "${t}"; done
+
+      - name: Log in to GHCR
+        if: steps.meta.outputs.mode != 'verify'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this tag already exists and can be trusted
+        id: published
+        env:
+          MODE: ${{ steps.meta.outputs.mode }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          CERT_IDENTITY: ${{ steps.meta.outputs.cert_identity }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${MODE}" == "verify" ]]; then
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            echo "digest=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          rc=0
+          d="$(.github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}")" || rc=$?
+          case "${rc}" in
+            0)
+              .github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" "${d}" >/dev/null
+              echo "${IMAGE}:${IMAGE_TAG} already exists with trusted provenance (${d}); no rebuild"
+              echo "published=true" >> "${GITHUB_OUTPUT}"
+              echo "digest=${d}" >> "${GITHUB_OUTPUT}"
+              ;;
+            1)
+              echo "published=false" >> "${GITHUB_OUTPUT}"
+              echo "digest=" >> "${GITHUB_OUTPUT}"
+              ;;
+            *) exit 1 ;;
+          esac
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.published != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      # The workflow's own commit supplies the scripts; the release commit is
+      # checked out separately and is only the source tree that gets built.
+      - name: Checkout workflow files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          path: src
+          persist-credentials: false
+
+      - name: Read build parameters
+        id: params
+        run: |
+          set -euo pipefail
+          go_version="$(sed -n 's/^GO_VERSION *:= *//p' src/Makefile)"
+          if [[ -z "${go_version}" ]]; then
+            echo "::error::GO_VERSION not found in Makefile"
+            exit 1
+          fi
+          {
+            echo "go_version=${go_version}"
+            echo "revision=$(git -C src rev-parse HEAD)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./src
+          file: ./src/cmd/loki/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            IMAGE_TAG=${{ needs.prepare.outputs.version }}
+            GO_VERSION=${{ steps.params.outputs.go_version }}
+          labels: |
+            org.opencontainers.image.title=loki
+            org.opencontainers.image.source=https://github.com/xscaler/loki
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.params.outputs.revision }}
+          tags: loki:${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          outputs: type=docker,dest=${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+
+      - name: Load image and check the reported version
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+        run: |
+          set -euo pipefail
+          docker load -i "${IMAGE_TAR}"
+          out="$(docker run --rm "loki:${ARCH}" -version 2>&1)"
+          echo "${out}"
+          if ! printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} "; then
+            echo "::error::binary does not report version ${VERSION}"
+            exit 1
+          fi
+
+      - name: Install Trivy
+        run: .github/scripts/xs-install-tool.sh trivy
+
+      - name: Trivy report (HIGH and CRITICAL)
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+          SARIF: ${{ runner.temp }}/trivy-${{ matrix.arch }}.sarif
+        run: |
+          set -euo pipefail
+          trivy image --input "${IMAGE_TAR}" --severity HIGH,CRITICAL \
+            --format table --exit-code 0 --no-progress
+          trivy image --input "${IMAGE_TAR}" --severity HIGH,CRITICAL \
+            --format sarif --output "${SARIF}" --exit-code 0 --no-progress
+
+      - name: Keep the SARIF report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-${{ matrix.arch }}
+          path: ${{ runner.temp }}/trivy-${{ matrix.arch }}.sarif
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Trivy gate (fixable CRITICAL fails the build)
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+        run: |
+          trivy image --input "${IMAGE_TAR}" --severity CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress
+
+      - name: Upload image tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loki-${{ matrix.arch }}
+          path: ${{ runner.temp }}/loki-${{ matrix.arch }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # SARIF is uploaded from its own job so build jobs, which run PR code, never
+  # hold security-events: write. Pull requests do not upload.
+  sarif:
+    name: upload Trivy SARIF
+    needs: [prepare, build]
+    if: "!cancelled() && github.event_name != 'pull_request' && needs.build.result != 'skipped'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download SARIF reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sarif-*
+          path: ${{ runner.temp }}/sarif
+
+      - name: Upload amd64
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/sarif-amd64/trivy-amd64.sarif
+          category: trivy-loki-amd64
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
+
+      - name: Upload arm64
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/sarif-arm64/trivy-arm64.sarif
+          category: trivy-loki-arm64
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
+
+  # Publish dry run for pull requests, main and tag pushes: the same script that
+  # publishes for real runs against a local registry. Only signing and
+  # attestation are skipped, they need an OIDC identity.
+  publish-dryrun:
+    name: publish dry run (local registry)
+    needs: [prepare, build]
+    if: needs.prepare.outputs.mode != 'release' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    env:
+      IMAGE: localhost:5000/loki
+      IMAGE_TAG: dryrun
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout workflow files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install crane
+        run: .github/scripts/xs-install-tool.sh crane
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: loki-*
+          path: ${{ runner.temp }}/images
+
+      - name: Push by digest and create the index
+        id: index
+        run: .github/scripts/xs-publish-images.sh "${IMAGE}" "${IMAGE_TAG}" "${RUNNER_TEMP}/images"
+
+      - name: The existence check now sees the tag
+        run: |
+          set -euo pipefail
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:${IMAGE_TAG}" >/dev/null
+          rc=0
+          .github/scripts/xs-manifest-exists.sh "${IMAGE}:never-published" >/dev/null || rc=$?
+          if [[ "${rc}" != "1" ]]; then
+            echo "::error::expected an absent tag to report rc=1, got ${rc}"
+            exit 1
+          fi
+
+      - name: Existing tags without trusted provenance are rejected
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+          COSIGN_ALLOW_INSECURE_REGISTRY: "true"
+        run: |
+          set -euo pipefail
+          .github/scripts/xs-install-tool.sh cosign
+          export CERT_IDENTITY="https://github.com/${REPOSITORY}/.github/workflows/xs-release.yml@refs/heads/main"
+
+          echo "== unsigned image: the trust check must reject it"
+          rc=0
+          log="$(.github/scripts/xs-trust-existing.sh "${IMAGE}" "${IMAGE_TAG}" "${COMMIT}" "${DIGEST}" 2>&1)" || rc=$?
+          echo "${log}"
+          if [[ "${rc}" == "0" ]]; then
+            echo "::error::an unsigned image was accepted"
+            exit 1
+          fi
+          grep -q 'exists without trusted provenance' <<<"${log}" || { echo "::error::rejection message missing"; exit 1; }
+          grep -q 'no valid signature' <<<"${log}" || { echo "::error::signature rejection reason missing"; exit 1; }
+          if grep -qi 'signing' <<<"${log}"; then
+            echo "::error::the trust check attempted to sign"
+            exit 1
+          fi
+
+          echo "== still unsigned afterwards (nothing was signed)"
+          out="$(cosign verify "${IMAGE}@${DIGEST}" --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            --certificate-identity "${CERT_IDENTITY}" 2>&1)" && {
+            echo "::error::image became signed"
+            exit 1
+          }
+          grep -q 'no signatures found' <<<"${out}" || { echo "::error::unexpected cosign answer: ${out}"; exit 1; }
+          echo "${out}" | grep 'no signatures found'
+
+          echo "== revision label check: matching commit passes"
+          .github/scripts/xs-check-revision-labels.sh "${IMAGE}" "${DIGEST}" "${COMMIT}"
+
+          echo "== revision label check: a different commit is rejected"
+          wrong="0000000000000000000000000000000000000000"
+          rc=0
+          log="$(.github/scripts/xs-check-revision-labels.sh "${IMAGE}" "${DIGEST}" "${wrong}" 2>&1)" || rc=$?
+          echo "${log}"
+          if [[ "${rc}" == "0" ]]; then
+            echo "::error::a mismatching revision label was accepted"
+            exit 1
+          fi
+          grep -q 'exists without trusted provenance' <<<"${log}" || { echo "::error::rejection message missing"; exit 1; }
+          grep -q 'revision label' <<<"${log}" || { echo "::error::label rejection reason missing"; exit 1; }
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Run both platform binaries from the registry
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker pull --quiet --platform "linux/${arch}" "${IMAGE}@${DIGEST}" >/dev/null
+            out="$(docker run --rm --platform "linux/${arch}" "${IMAGE}@${DIGEST}" -version 2>&1)"
+            echo "${out}"
+            printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
+              echo "::error::linux/${arch} binary does not report ${VERSION}"
+              exit 1
+            }
+          done
+
+  publish:
+    name: publish to GHCR
+    needs: [prepare, build]
+    if: >-
+      !cancelled() && needs.prepare.outputs.mode != 'verify' &&
+      needs.prepare.outputs.published != 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ needs.prepare.outputs.environment }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout workflow files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install crane, cosign and syft
+        run: |
+          set -euo pipefail
+          for t in crane cosign syft; do .github/scripts/xs-install-tool.sh "${t}"; done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: loki-*
+          path: ${{ runner.temp }}/images
+
+      - name: Push per-arch images by digest and create the index
+        id: index
+        run: .github/scripts/xs-publish-images.sh "${IMAGE}" "${IMAGE_TAG}" "${RUNNER_TEMP}/images"
+
+      - name: Attest build provenance (index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOMs (one per platform image)
+        env:
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          syft "${IMAGE}@${AMD64}" -o "spdx-json=${RUNNER_TEMP}/sbom-amd64.spdx.json"
+          syft "${IMAGE}@${ARM64}" -o "spdx-json=${RUNNER_TEMP}/sbom-arm64.spdx.json"
+
+      - name: Attest SBOM (linux/amd64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.amd64 }}
+          sbom-path: ${{ runner.temp }}/sbom-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest SBOM (linux/arm64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.arm64 }}
+          sbom-path: ${{ runner.temp }}/sbom-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Sign the index with cosign (keyless)
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          CERT_IDENTITY: ${{ needs.prepare.outputs.cert_identity }}
+        run: .github/scripts/xs-ensure-signed.sh "${IMAGE}@${DIGEST}"
+
+  # On the reuse path (a trusted image already exists) build and publish are
+  # skipped. "skipped" propagates through needs, so the conditions below name
+  # the allowed results explicitly instead of relying on the default.
+  verify:
+    name: verify signatures and version
+    needs: [prepare, publish]
+    if: >-
+      !cancelled() && needs.prepare.outputs.mode != 'verify' &&
+      (needs.publish.result == 'success' ||
+       (needs.publish.result == 'skipped' && needs.prepare.outputs.published == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest || needs.prepare.outputs.digest }}
+      CERT_IDENTITY: ${{ needs.prepare.outputs.cert_identity }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout workflow files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install crane and cosign
+        run: |
+          set -euo pipefail
+          for t in crane cosign; do .github/scripts/xs-install-tool.sh "${t}"; done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the cosign signature (exact identity)
+        run: |
+          set -euo pipefail
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            --certificate-identity "${CERT_IDENTITY}" >/dev/null
+
+      - name: Verify provenance and per-platform SBOM attestations
+        run: |
+          set -euo pipefail
+          echo "== provenance on the index"
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${REPOSITORY}" \
+            --cert-identity "${CERT_IDENTITY}"
+          manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
+          for arch in amd64 arm64; do
+            d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
+            echo "== SBOM for linux/${arch} (${d})"
+            gh attestation verify "oci://${IMAGE}@${d}" --repo "${REPOSITORY}" \
+              --cert-identity "${CERT_IDENTITY}" \
+              --predicate-type https://spdx.dev/Document/v2.3
+          done
+
+      - name: Verify the tag, platforms and revision labels
+        run: |
+          set -euo pipefail
+          got="$(crane digest "${IMAGE}:${IMAGE_TAG}")"
+          if [[ "${got}" != "${DIGEST}" ]]; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} resolves to ${got}, expected ${DIGEST}"
+            exit 1
+          fi
+          manifest="$(crane manifest "${IMAGE}@${DIGEST}")"
+          for arch in amd64 arm64; do
+            d="$(jq -r --arg a "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' <<<"${manifest}")"
+            if [[ ! "${d}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::missing linux/${arch} in ${IMAGE}@${DIGEST}"
+              exit 1
+            fi
+            rev="$(crane config "${IMAGE}@${d}" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')"
+            if [[ "${rev}" != "${COMMIT}" ]]; then
+              echo "::error::linux/${arch} revision label is '${rev}', expected ${COMMIT}"
+              exit 1
+            fi
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Run both platform binaries and check the reported version
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker pull --quiet --platform "linux/${arch}" "${IMAGE}@${DIGEST}" >/dev/null
+            out="$(docker run --rm --platform "linux/${arch}" "${IMAGE}@${DIGEST}" -version 2>&1)"
+            echo "${out}"
+            printf '%s\n' "${out}" | head -n1 | grep -Fq "loki, version ${VERSION} " || {
+              echo "::error::linux/${arch} binary does not report ${VERSION}"
+              exit 1
+            }
+          done
+
+      - name: The release tag still resolves to the verified digest
+        run: |
+          set -euo pipefail
+          got="$(crane digest "${IMAGE}:${IMAGE_TAG}")"
+          if [[ "${got}" != "${DIGEST}" ]]; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} moved to ${got} during verification, expected ${DIGEST}"
+            exit 1
+          fi
+
+  # The git tag is created only now that the image is published and verified.
+  # Tags created with GITHUB_TOKEN do not start another run.
+  tag:
+    name: create release tag
+    needs: [prepare, verify]
+    # Runs after verify succeeded, on the fresh and the reuse path alike. It is
+    # skipped for rehearsal and verify runs only because they never tag.
+    if: "!cancelled() && needs.verify.result == 'success' && needs.prepare.outputs.mode == 'release'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the release tag
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+    steps:
+      - name: Create the tag, or confirm the existing one points at the release commit
+        run: |
+          set -euo pipefail
+          err="$(mktemp)"
+          if obj="$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha' 2>"${err}")"; then
+            type="${obj% *}"
+            sha="${obj#* }"
+            if [[ "${type}" == "tag" ]]; then
+              sha="$(gh api "repos/${REPOSITORY}/git/tags/${sha}" --jq .object.sha)"
+            fi
+            if [[ "${sha}" != "${COMMIT}" ]]; then
+              echo "::error::tag ${TAG} points at ${sha}, not the release commit ${COMMIT}"
+              exit 1
+            fi
+            echo "tag ${TAG} already points at ${COMMIT}"
+          elif grep -q 'HTTP 404' "${err}"; then
+            gh api --method POST "repos/${REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${TAG}" -f "sha=${COMMIT}"
+          else
+            echo "::error::could not look up tag ${TAG}:"
+            cat "${err}"
+            exit 1
+          fi
