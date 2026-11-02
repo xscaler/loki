@@ -28,18 +28,21 @@ on:
     branches:
       - main
   push:
-    branches:
-      - "**"
+    # rehearsal-sync/** branches are written by the xs-sync rehearsal with an App
+    # token, which (unlike GITHUB_TOKEN) triggers workflows; skip them.
+    branches-ignore:
+      - "rehearsal-sync/**"
+      - "sync/**" # sync PRs run on the pull_request event only
   workflow_dispatch: {}
   schedule:
     - cron: "17 3 * * 0"
 
 permissions: {}
 
-# A branch with an open pull request triggers both a push and a pull_request
-# run; they share one group so only one of them survives.
+# The group names the event and the head repository, so a fork PR that reuses a
+# branch name, or a push next to its pull request, never cancels another run.
 concurrency:
-  group: xs-test-${{ github.head_ref || github.ref_name }}
+  group: xs-test-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
