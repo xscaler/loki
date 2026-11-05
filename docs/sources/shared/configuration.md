@@ -1936,6 +1936,45 @@ ingest_limits_frontend_client:
 # configuration file.
 [runtime_config: <runtime_config>]
 
+xscaler_admin_store:
+  # Read per-tenant limits from the xScaler admin store in object storage. When
+  # enabled, per-tenant limits come only from the admin store and per-tenant
+  # limits in the runtime config are ignored.
+  # CLI flag: -xscaler.admin-store.enabled
+  [enabled: <boolean> | default = false]
+
+  # Directory where the last applied admin store generation is kept, so a
+  # restart can serve it while the bucket is unreachable.
+  # CLI flag: -xscaler.admin-store.cache-dir
+  [cache_dir: <string> | default = ""]
+
+  # How often the admin store manifest is polled.
+  # CLI flag: -xscaler.admin-store.poll-interval
+  [poll_interval: <duration> | default = 5s]
+
+  # How long to wait for the first admin store snapshot at startup before
+  # continuing with default limits. Must be positive. The compactor waits until
+  # a snapshot is applied when retention is enabled. In a process that also runs
+  # the compactor (for example -target=all or -target=backend) with retention
+  # enabled, /ready stays not ready until the first snapshot is applied while
+  # the other modules keep serving.
+  # CLI flag: -xscaler.admin-store.startup-wait
+  [startup_wait: <duration> | default = 30s]
+
+  # Backend of the admin store bucket. The bucket block below is read directly
+  # and does not depend on -use-thanos-objstore. Supported values: [s3 gcs azure
+  # swift filesystem alibabacloud bos].
+  # CLI flag: -xscaler.admin-store.backend
+  [backend: <string> | default = "s3"]
+
+  # The thanos_object_store_config block configures the connection to object
+  # storage backend using thanos-io/objstore clients. This will become the
+  # default way of configuring object store clients in future releases.
+  # Currently this is opt-in and takes effect only when `-use-thanos-objstore`
+  # is set to true.
+  # The CLI flags prefix for this block configuration is: xscaler.admin-store
+  [<thanos_object_store_config>]
+
 # These are values which allow you to control aspects of Loki's operation, most
 # commonly used for controlling types of higher verbosity logging, the values
 # here can be overridden in the `configs` section of the `runtime_config` file.
@@ -7452,6 +7491,7 @@ Currently this is opt-in and takes effect only when `-use-thanos-objstore` is se
 - `object-store`
 - `ruler-storage`
 - `ui.goldfish.results`
+- `xscaler.admin-store`
 
 &nbsp;
 

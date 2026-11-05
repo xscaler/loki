@@ -78,6 +78,7 @@ import (
 	lokiring "github.com/grafana/loki/v3/pkg/util/ring"
 	serverutil "github.com/grafana/loki/v3/pkg/util/server"
 	"github.com/grafana/loki/v3/pkg/validation"
+	"github.com/grafana/loki/v3/pkg/xscaler/adminstore"
 )
 
 // Config is the root config for Loki.
@@ -122,6 +123,7 @@ type Config struct {
 	IngestLimitsFrontendClient limits_frontend_client.Config `yaml:"ingest_limits_frontend_client,omitempty" category:"experimental"`
 
 	RuntimeConfig     runtimeconfig.Config `yaml:"runtime_config,omitempty"`
+	AdminStore        adminstore.Config    `yaml:"xscaler_admin_store,omitempty"`
 	OperationalConfig runtime.Config       `yaml:"operational_config,omitempty"`
 	Tracing           tracing.Config       `yaml:"tracing"`
 	Analytics         analytics.Config     `yaml:"analytics"`
@@ -222,6 +224,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Worker.RegisterFlags(f)
 	c.QueryRange.RegisterFlags(f)
 	c.RuntimeConfig.RegisterFlags(f)
+	c.AdminStore.RegisterFlags(f)
 	c.MemberlistKV.RegisterFlags(f)
 	c.Tracing.RegisterFlags(f)
 	c.CompactorConfig.RegisterFlags(f)
@@ -286,6 +289,9 @@ func (c *Config) Validate() error {
 
 	if err := c.SchemaConfig.Validate(); err != nil {
 		errs = append(errs, errors.Wrap(err, "CONFIG ERROR: invalid schema config"))
+	}
+	if err := c.AdminStore.Validate(); err != nil {
+		errs = append(errs, errors.Wrap(err, "CONFIG ERROR: invalid xscaler_admin_store config"))
 	}
 	if err := c.StorageConfig.Validate(); err != nil {
 		errs = append(errs, errors.Wrap(err, "CONFIG ERROR: invalid storage_config config"))
@@ -440,6 +446,7 @@ type Loki struct {
 	rulerAPI                            *base_ruler.API
 	stopper                             queryrange.Stopper
 	runtimeConfig                       *runtimeconfig.Manager
+	adminStore                          *adminstore.Store
 	MemberlistKV                        *memberlist.KVInitService
 	compactor                           *compactor.Compactor
 	QueryFrontEndMiddleware             queryrangebase.Middleware
@@ -757,6 +764,8 @@ func (t *Loki) setupModuleManager() error {
 	}
 
 	mm.RegisterModule(RuntimeConfig, t.initRuntimeConfig, modules.UserInvisibleModule)
+	mm.RegisterModule(AdminStore, t.initAdminStore, modules.UserInvisibleModule)
+	mm.RegisterModule(AdminStoreReady, t.initAdminStoreReady, modules.UserInvisibleModule)
 	mm.RegisterModule(MemberlistKV, t.initMemberlistKV, modules.UserInvisibleModule)
 	mm.RegisterModule(Ring, t.initRing, modules.UserInvisibleModule)
 	mm.RegisterModule(IngestLimitsRing, t.initIngestLimitsRing, modules.UserInvisibleModule)
@@ -816,7 +825,9 @@ func (t *Loki) setupModuleManager() error {
 	deps := map[string][]string{
 		Ring:                         {RuntimeConfig, Server, MemberlistKV},
 		Analytics:                    {},
-		Overrides:                    {RuntimeConfig},
+		AdminStore:                   {RuntimeConfig},
+		AdminStoreReady:              {AdminStore},
+		Overrides:                    {RuntimeConfig, AdminStore},
 		OverridesExporter:            {Overrides, Server, UIRing},
 		TenantConfigs:                {RuntimeConfig},
 		UI:                           {Server, MemberlistKV, UIRing},
@@ -838,7 +849,7 @@ func (t *Loki) setupModuleManager() error {
 		Ruler:                        {Ring, Server, RulerStorage, RuleEvaluator, Overrides, TenantConfigs, Analytics, UIRing},
 		RuleEvaluator:                {Ring, Server, Store, IngesterQuerier, Overrides, TenantConfigs, Analytics},
 		TableManager:                 {Server, Analytics, UIRing},
-		Compactor:                    {Server, Overrides, MemberlistKV, Analytics, UIRing},
+		Compactor:                    {Server, Overrides, MemberlistKV, Analytics, UIRing, AdminStoreReady},
 		IndexGateway:                 {Server, Store, BloomStore, IndexGatewayRing, IndexGatewayInterceptors, Analytics, UIRing},
 		BloomGateway:                 {Server, BloomStore, Analytics, UIRing},
 		BloomPlanner:                 {Server, BloomStore, Analytics, Store, UIRing},
