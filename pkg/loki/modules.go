@@ -148,6 +148,8 @@ const (
 	IngesterQuerier              = "ingester-querier"
 	IngesterGRPCInterceptors     = "ingester-grpc-interceptors"
 	RuntimeConfig                = "runtime-config"
+	AdminStore                   = "xscaler-admin-store"
+	AdminStoreReady              = "xscaler-admin-store-ready"
 	MemberlistKV                 = "memberlist-kv"
 	Analytics                    = "analytics"
 	CacheGenerationLoader        = "cache-generation-loader"

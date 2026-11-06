@@ -2118,6 +2118,9 @@ github.com/xhit/go-str2duration/v2
 # github.com/xo/terminfo v1.0.0
 ## explicit; go 1.19
 github.com/xo/terminfo
+# github.com/xscaler/dskit/xstenant v0.1.0
+## explicit; go 1.26.10
+github.com/xscaler/dskit/xstenant
 # github.com/yuin/gopher-lua v1.1.2
 ## explicit; go 1.23
 github.com/yuin/gopher-lua
