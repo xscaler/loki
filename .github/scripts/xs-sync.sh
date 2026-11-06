@@ -53,10 +53,23 @@ XS_TAG_FORMAT="${XS_TAG_FORMAT:-v%s}"
 # Upstream branches to mirror as origin/upstream/<name>.
 XS_BRANCH_REGEX="${XS_BRANCH_REGEX:-^(main|release-[0-9]+(\\.[0-9]+)*(\\.x)?)\$}"
 # Paths that may differ from the upstream release tag (our patch set), as
-# shell globs matched against the full path ("*" also matches "/").
+# shell globs matched against the full path ("*" also matches "/"). Besides the
+# xs CI files this is the admin store patch: the module files and generated
+# config reference it touches, the pkg/loki hooks, our own pkg/xscaler tree and
+# the vendored xscaler modules.
 XS_PATCH_PATHS=(
   ".github/workflows/xs-*"
   ".github/scripts/xs-*"
+  "go.mod"
+  "go.sum"
+  "docs/sources/shared/configuration.md"
+  "pkg/loki/loki.go"
+  "pkg/loki/modules.go"
+  "pkg/loki/xscaler_admin_store.go"
+  "pkg/loki/xscaler_admin_store_test.go"
+  "pkg/xscaler/*"
+  "vendor/modules.txt"
+  "vendor/github.com/xscaler/*"
 )
 # The namespace upstream must never own: paths that only this fork may carry.
 # Shell globs like XS_PATCH_PATHS, but workflows, scripts and actions only (not
