@@ -94,7 +94,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/uber/jaeger-client-go v2.30.0+incompatible
 	github.com/xdg-go/scram v1.2.0
-	github.com/xscaler/dskit/xstenant v0.1.0
+	github.com/xscaler/dskit/xstenant v0.2.0
 	go.etcd.io/bbolt v1.4.3
 	go.uber.org/atomic v1.11.0
 	go.uber.org/goleak v1.3.0
