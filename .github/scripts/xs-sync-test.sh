@@ -100,7 +100,7 @@ xs_ver_gt 2.9.20 3.0.0 && r=yes || r=no
 expect "gt major" "no" "${r}"
 
 # patch path rules
-for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod vendor/modules.txt pkg/loki/modules.go pkg/xscaler/adminstore/store.go pkg/distributor/distributor.go pkg/distributor/http.go pkg/distributor/xscaler_gate.go pkg/distributor/xscaler_gate_test.go vendor/github.com/xscaler/dskit/xstenant/reader.go; do
+for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod vendor/modules.txt pkg/loki/modules.go pkg/xscaler/adminstore/store.go pkg/xscaler/adminstore/auth.go pkg/xscaler/adminstore/auth_test.go pkg/distributor/distributor.go pkg/distributor/http.go pkg/distributor/xscaler_gate.go pkg/distributor/xscaler_gate_test.go vendor/github.com/xscaler/dskit/xstenant/reader.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "allowed ${p}" "yes" "${r}"
 done

@@ -6,13 +6,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
@@ -172,4 +176,70 @@ func TestAdminStoreOtherTargetsContinueAfterStartupWait(t *testing.T) {
 	require.NoError(t, services.StartAndAwaitRunning(ctx, svc))
 	t.Cleanup(func() { _ = services.StopAndAwaitTerminated(context.Background(), svc) })
 	require.Nil(t, l.TenantLimits.TenantLimits("t-runtime"))
+}
+
+func TestAdminStoreEnforceAuthWrapsHTTPAuthMiddleware(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	status := func(h http.Handler, path string) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Code
+	}
+
+	t.Run("off leaves the middleware alone", func(t *testing.T) {
+		l := adminStoreLoki(t, t.TempDir(), Querier)
+		l.Cfg.AuthEnabled = true
+		l.setupAuthMiddleware()
+		before := l.HTTPAuthMiddleware
+		svc, err := l.initAdminStore()
+		require.NoError(t, err)
+		require.NotNil(t, svc)
+		require.Equal(t, reflect.ValueOf(before).Pointer(), reflect.ValueOf(l.HTTPAuthMiddleware).Pointer())
+	})
+
+	t.Run("on checks authenticated routes only", func(t *testing.T) {
+		l := adminStoreLoki(t, t.TempDir(), Querier)
+		l.Cfg.AuthEnabled = true
+		l.Cfg.AdminStore.EnforceAuth = "on"
+		l.setupAuthMiddleware()
+		_, err := l.initAdminStore()
+		require.NoError(t, err)
+
+		mux := http.NewServeMux()
+		mux.Handle("/loki/api/v1/query", l.HTTPAuthMiddleware.Wrap(inner))
+		mux.Handle("/ready", inner)
+		require.Equal(t, http.StatusUnauthorized, status(mux, "/loki/api/v1/query"))
+		require.Equal(t, http.StatusNoContent, status(mux, "/ready"))
+	})
+
+	t.Run("shadow never blocks", func(t *testing.T) {
+		l := adminStoreLoki(t, t.TempDir(), Querier)
+		l.Cfg.AuthEnabled = true
+		l.Cfg.AdminStore.EnforceAuth = "shadow"
+		l.setupAuthMiddleware()
+		_, err := l.initAdminStore()
+		require.NoError(t, err)
+		// The key is unknown, yet the request reaches the handler with its own org ID.
+		var org string
+		h := l.HTTPAuthMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			org, _ = user.ExtractOrgID(r.Context())
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query", nil)
+		req.Header.Set("Authorization", "Bearer unknown")
+		req.Header.Set("X-Scope-OrgID", "tenant-a")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusNoContent, rec.Code)
+		require.Equal(t, "tenant-a", org)
+	})
+
+	t.Run("on requires auth_enabled", func(t *testing.T) {
+		l := adminStoreLoki(t, t.TempDir(), Querier)
+		l.Cfg.AuthEnabled = false
+		l.Cfg.AdminStore.EnforceAuth = "on"
+		l.setupAuthMiddleware()
+		_, err := l.initAdminStore()
+		require.Error(t, err)
+	})
 }

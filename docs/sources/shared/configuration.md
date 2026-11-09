@@ -1969,6 +1969,17 @@ xscaler_admin_store:
   # CLI flag: -xscaler.admin-store.enforce-state
   [enforce_state: <string> | default = "off"]
 
+  # Authorize API key requests on the external HTTP API against the keys
+  # published in the admin store. A request needs an Authorization: Bearer <key>
+  # header and an X-Scope-OrgID header that names the key's tenant, and the key
+  # needs the read or write scope for the path. Requires auth_enabled. Supported
+  # values: off, shadow (count what would be denied, deny nothing, leave headers
+  # unchanged), on (deny with 401 or 403, set X-Scope-OrgID to the key's
+  # tenant). Traffic between components is never checked. Only applies when the
+  # admin store is enabled.
+  # CLI flag: -xscaler.admin-store.enforce-auth
+  [enforce_auth: <string> | default = "off"]
+
   # Backend of the admin store bucket. The bucket block below is read directly
   # and does not depend on -use-thanos-objstore. Supported values: [s3 gcs azure
   # swift filesystem alibabacloud bos].

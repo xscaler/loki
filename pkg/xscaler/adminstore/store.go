@@ -42,6 +42,7 @@ type Store struct {
 	cfg         Config
 	reader      *xstenant.Reader
 	enforceMode xstenant.EnforceMode
+	authMode    xstenant.EnforceMode
 	source      *xstenant.Source[*validation.Limits]
 	startupWait time.Duration
 	opts        Options
@@ -63,6 +64,11 @@ func New(cfg Config, bucket xstenant.Bucket, opts Options, logger log.Logger, re
 		return nil, fmt.Errorf("%senforce-state: %w", flagPrefix, err)
 	}
 
+	authMode, err := cfg.authMode()
+	if err != nil {
+		return nil, fmt.Errorf("%senforce-auth: %w", flagPrefix, err)
+	}
+
 	logger = log.With(logger, "component", "xscaler-admin-store")
 	reader, err := xstenant.New(rcfg, bucket, logger, reg)
 	if err != nil {
@@ -73,6 +79,7 @@ func New(cfg Config, bucket xstenant.Bucket, opts Options, logger log.Logger, re
 		cfg:         cfg,
 		reader:      reader,
 		enforceMode: mode,
+		authMode:    authMode,
 		source:      xstenant.NewSource(reader, engine, decode, logger, reg),
 		startupWait: cfg.StartupWait,
 		opts:        opts,

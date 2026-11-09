@@ -2,8 +2,10 @@ package loki
 
 import (
 	"context"
+	"errors"
 
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -49,6 +51,16 @@ func (t *Loki) initAdminStore() (services.Service, error) {
 	}
 	t.adminStore = store
 	t.TenantLimits = store.TenantLimits()
+
+	if authMW := store.AuthMiddleware(t.Cfg.Server.PathPrefix); authMW != nil {
+		if !t.Cfg.AuthEnabled {
+			return nil, errors.New("-xscaler.admin-store.enforce-auth requires auth_enabled")
+		}
+		// Every module that serves the external HTTP API depends on the
+		// overrides, so it initialises after this and sees the wrapped
+		// middleware. The key check runs before the org ID is read.
+		t.HTTPAuthMiddleware = middleware.Merge(authMW, t.HTTPAuthMiddleware)
+	}
 	return store, nil
 }
 
