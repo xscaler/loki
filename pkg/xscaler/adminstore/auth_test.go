@@ -67,7 +67,7 @@ type seen struct {
 
 func serve(s *Store, prefix, method, path, token, org string) (*httptest.ResponseRecorder, *seen) {
 	got := &seen{}
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		got.called = true
 		got.org = r.Header.Get("X-Scope-OrgID")
 	})
