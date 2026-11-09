@@ -191,6 +191,10 @@ type Distributor struct {
 
 	RequestParserWrapper push.RequestParserWrapper
 
+	// PushGate denies pushes of a tenant before they are parsed or validated.
+	// Nil allows everything. See xscaler_gate.go.
+	PushGate PushGate
+
 	// metrics
 	ingesterAppends                       *prometheus.CounterVec
 	ingesterAppendTimeouts                *prometheus.CounterVec
@@ -552,6 +556,9 @@ func (d *Distributor) waitSimulatedLatency(ctx context.Context, tenantID string,
 func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*logproto.PushResponse, error) {
 	tenantID, err := tenant.TenantID(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := d.pushGateGRPCError(tenantID); err != nil {
 		return nil, err
 	}
 	return d.PushWithResolver(ctx, req, newRequestScopedStreamResolver(tenantID, d.validator.Limits, d.logger), constants.Loki)

@@ -398,6 +398,10 @@ func (t *Loki) initDistributor() (services.Service, error) {
 		t.distributor.RequestParserWrapper = t.PushParserWrapper
 	}
 
+	if t.adminStore != nil {
+		t.distributor.PushGate = t.adminStore.PushGate()
+	}
+
 	// Register the distributor to receive Push requests over GRPC
 	// EXCEPT when running with `-target=all` or `-target=` contains `ingester`
 	if !t.Cfg.isTarget(All) && !t.Cfg.isTarget(Write) && !t.Cfg.isTarget(Ingester) {

@@ -55,7 +55,8 @@ XS_BRANCH_REGEX="${XS_BRANCH_REGEX:-^(main|release-[0-9]+(\\.[0-9]+)*(\\.x)?)\$}
 # Paths that may differ from the upstream release tag (our patch set), as
 # shell globs matched against the full path ("*" also matches "/"). Besides the
 # xs CI files this is the admin store patch: the module files and generated
-# config reference it touches, the pkg/loki hooks, our own pkg/xscaler tree and
+# config reference it touches, the pkg/loki hooks, the distributor push gate
+# (two hook files plus our own xscaler_* files), our own pkg/xscaler tree and
 # the vendored xscaler modules.
 XS_PATCH_PATHS=(
   ".github/workflows/xs-*"
@@ -63,6 +64,9 @@ XS_PATCH_PATHS=(
   "go.mod"
   "go.sum"
   "docs/sources/shared/configuration.md"
+  "pkg/distributor/distributor.go"
+  "pkg/distributor/http.go"
+  "pkg/distributor/xscaler_*"
   "pkg/loki/loki.go"
   "pkg/loki/modules.go"
   "pkg/loki/xscaler_admin_store.go"
