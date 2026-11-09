@@ -41,6 +41,7 @@ type Store struct {
 
 	cfg         Config
 	reader      *xstenant.Reader
+	enforceMode xstenant.EnforceMode
 	source      *xstenant.Source[*validation.Limits]
 	startupWait time.Duration
 	opts        Options
@@ -57,6 +58,11 @@ func New(cfg Config, bucket xstenant.Bucket, opts Options, logger log.Logger, re
 	rcfg.PollInterval = cfg.PollInterval
 	rcfg.CacheKey = cacheKey(cfg, rcfg.Prefix)
 
+	mode, err := cfg.enforceMode()
+	if err != nil {
+		return nil, fmt.Errorf("%senforce-state: %w", flagPrefix, err)
+	}
+
 	logger = log.With(logger, "component", "xscaler-admin-store")
 	reader, err := xstenant.New(rcfg, bucket, logger, reg)
 	if err != nil {
@@ -66,6 +72,7 @@ func New(cfg Config, bucket xstenant.Bucket, opts Options, logger log.Logger, re
 	s := &Store{
 		cfg:         cfg,
 		reader:      reader,
+		enforceMode: mode,
 		source:      xstenant.NewSource(reader, engine, decode, logger, reg),
 		startupWait: cfg.StartupWait,
 		opts:        opts,
@@ -194,4 +201,17 @@ func (t tenantLimits) TenantLimits(userID string) *validation.Limits {
 
 func (t tenantLimits) AllByUserID() map[string]*validation.Limits {
 	return t.source.All()
+}
+
+// PushGate returns the push gate for the configured enforce state, or nil when
+// the state is off. The gate reports whether a tenant's pushes must be denied
+// and why. Only a tenant published as soft_locked is ever denied, and only in
+// mode on. In mode shadow the decision is counted and the push is allowed.
+func (s *Store) PushGate() func(tenantID string) (deny bool, reason string) {
+	if s.enforceMode == xstenant.EnforceOff {
+		return nil
+	}
+	return func(tenantID string) (bool, string) {
+		return s.reader.CheckPush(tenantID, s.enforceMode)
+	}
 }

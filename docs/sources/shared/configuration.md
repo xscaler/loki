@@ -1961,6 +1961,14 @@ xscaler_admin_store:
   # CLI flag: -xscaler.admin-store.startup-wait
   [startup_wait: <duration> | default = 30s]
 
+  # Deny pushes from tenants the admin store publishes as soft_locked (billing).
+  # Reads are never denied. Denied pushes get HTTP 429 with Retry-After: 60
+  # (gRPC ResourceExhausted) and the reason billing_soft_locked. Supported
+  # values: off, shadow (count what would be denied, deny nothing), on. Only
+  # applies when the admin store is enabled.
+  # CLI flag: -xscaler.admin-store.enforce-state
+  [enforce_state: <string> | default = "off"]
+
   # Backend of the admin store bucket. The bucket block below is read directly
   # and does not depend on -use-thanos-objstore. Supported values: [s3 gcs azure
   # swift filesystem alibabacloud bos].

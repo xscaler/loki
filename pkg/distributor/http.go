@@ -42,6 +42,10 @@ func (d *Distributor) pushHandler(w http.ResponseWriter, r *http.Request, pushRe
 		return
 	}
 
+	if d.denyPushHTTP(w, tenantID, errorWriter, logger) {
+		return
+	}
+
 	if d.RequestParserWrapper != nil {
 		pushRequestParser = d.RequestParserWrapper(pushRequestParser)
 	}
